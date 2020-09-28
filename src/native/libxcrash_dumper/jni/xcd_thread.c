@@ -43,7 +43,6 @@
 #include "xcd_regs.h"
 #include "xcd_util.h"
 #include "xcd_log.h"
-#include "xcd_recorder.h"
 
 void xcd_thread_init(xcd_thread_t *self, pid_t pid, pid_t tid)
 {
@@ -63,6 +62,7 @@ void xcd_thread_suspend(xcd_thread_t *self)
         XCD_LOG_WARN("THREAD: ptrace ATTACH failed, errno=%d", errno);
 #endif
         self->status = XCD_THREAD_STATUS_ATTACH;
+        return;
     }
 
     errno = 0;
@@ -75,6 +75,7 @@ void xcd_thread_suspend(xcd_thread_t *self)
             XCD_LOG_ERROR("THREAD: waitpid for ptrace ATTACH failed, errno=%d", errno);
 #endif
             self->status = XCD_THREAD_STATUS_ATTACH_WAIT;
+            return;
         }
         errno = 0;
     }
@@ -87,11 +88,10 @@ void xcd_thread_resume(xcd_thread_t *self)
 
 void xcd_thread_load_info(xcd_thread_t *self)
 {
-    char buf[128];
+    char buf[64] = "\0";
     
-    if(0 != xcc_util_get_thread_name(self->tid, buf, sizeof(buf)) ||
-       NULL == (self->tname = strdup(xcc_util_trim(buf))))
-        self->tname = "<unknown>";
+    xcc_util_get_thread_name(self->tid, buf, sizeof(buf));
+    if(NULL == (self->tname = strdup(buf))) self->tname = "unknown";
 }
 
 void xcd_thread_load_regs(xcd_thread_t *self)
@@ -104,6 +104,7 @@ void xcd_thread_load_regs(xcd_thread_t *self)
     {
         XCD_LOG_ERROR("THREAD: ptrace GETREGS failed, errno=%d", errno);
         self->status = XCD_THREAD_STATUS_REGS;
+        return;
     }
     regs_len = XCD_REGS_USER_NUM;
 #else
@@ -114,6 +115,7 @@ void xcd_thread_load_regs(xcd_thread_t *self)
     {
         XCD_LOG_ERROR("THREAD: ptrace GETREGSET failed, errno=%d", errno);
         self->status = XCD_THREAD_STATUS_REGS;
+        return;
     }
     regs_len = iovec.iov_len / sizeof(uintptr_t);
 #endif
@@ -130,47 +132,50 @@ int xcd_thread_load_frames(xcd_thread_t *self, xcd_maps_t *maps)
 #if XCD_THREAD_DEBUG
     XCD_LOG_DEBUG("THREAD: load frames, tid=%d, tname=%s", self->tid, self->tname);
 #endif
+
+    if(XCD_THREAD_STATUS_OK != self->status) return XCC_ERRNO_STATE; //do NOT ignore
+
     return xcd_frames_create(&(self->frames), &(self->regs), maps, self->pid);
 }
 
-int xcd_thread_record_info(xcd_thread_t *self, xcd_recorder_t *recorder, const char *pname)
+int xcd_thread_record_info(xcd_thread_t *self, int log_fd, const char *pname)
 {
-    return xcd_recorder_print(recorder, "pid: %d, tid: %d, name: %s  >>> %s <<<\n",
-                              self->pid, self->tid, self->tname, pname);
+    return xcc_util_write_format(log_fd, "pid: %d, tid: %d, name: %s  >>> %s <<<\n",
+                                 self->pid, self->tid, self->tname, pname);
 }
 
-int xcd_thread_record_regs(xcd_thread_t *self, xcd_recorder_t *recorder)
+int xcd_thread_record_regs(xcd_thread_t *self, int log_fd)
 {
-    if(XCD_THREAD_STATUS_OK != self->status) return XCC_ERRNO_STATE;
+    if(XCD_THREAD_STATUS_OK != self->status) return 0; //ignore
     
-    return xcd_regs_record(&(self->regs), recorder);
+    return xcd_regs_record(&(self->regs), log_fd);
 }
 
-int xcd_thread_record_backtrace(xcd_thread_t *self, xcd_recorder_t *recorder)
+int xcd_thread_record_backtrace(xcd_thread_t *self, int log_fd)
 {
-    if(XCD_THREAD_STATUS_OK != self->status) return XCC_ERRNO_STATE;
+    if(XCD_THREAD_STATUS_OK != self->status) return 0; //ignore
 
-    return xcd_frames_record_backtrace(self->frames, recorder);
+    return xcd_frames_record_backtrace(self->frames, log_fd);
 }
 
-int xcd_thread_record_buildid(xcd_thread_t *self, xcd_recorder_t *recorder)
+int xcd_thread_record_buildid(xcd_thread_t *self, int log_fd, int dump_elf_hash, uintptr_t fault_addr)
 {
-    if(XCD_THREAD_STATUS_OK != self->status) return XCC_ERRNO_STATE;
+    if(XCD_THREAD_STATUS_OK != self->status) return 0; //ignore
 
-    return xcd_frames_record_buildid(self->frames, recorder);
+    return xcd_frames_record_buildid(self->frames, log_fd, dump_elf_hash, fault_addr);
 }
 
-int xcd_thread_record_stack(xcd_thread_t *self, xcd_recorder_t *recorder)
+int xcd_thread_record_stack(xcd_thread_t *self, int log_fd)
 {
-    if(XCD_THREAD_STATUS_OK != self->status) return XCC_ERRNO_STATE;
+    if(XCD_THREAD_STATUS_OK != self->status) return 0; //ignore
     
-    return xcd_frames_record_stack(self->frames, recorder);
+    return xcd_frames_record_stack(self->frames, log_fd);
 }
 
 #define XCD_THREAD_MEMORY_BYTES_TO_DUMP 256
 #define XCD_THREAD_MEMORY_BYTES_PER_LINE 16
 
-static int xcd_thread_record_memory_by_addr(xcd_thread_t *self, xcd_recorder_t *recorder,
+static int xcd_thread_record_memory_by_addr(xcd_thread_t *self, int log_fd,
                                             const char *label, uintptr_t addr)
 {
     int r;
@@ -189,7 +194,7 @@ static int xcd_thread_record_memory_by_addr(xcd_thread_t *self, xcd_recorder_t *
         return 0; //not an error
     }
 
-    if(0 != (r = xcd_recorder_print(recorder, "memory near %s:\n", label))) return r;
+    if(0 != (r = xcc_util_write_format(log_fd, "memory near %s:\n", label))) return r;
     
     // Dump 256 bytes
     uintptr_t data[XCD_THREAD_MEMORY_BYTES_TO_DUMP/sizeof(uintptr_t)];
@@ -205,7 +210,7 @@ static int xcd_thread_record_memory_by_addr(xcd_thread_t *self, xcd_recorder_t *
         // In this case, we might want to try another read at the beginning of
         // the next page only if it's within the amount of memory we would have
         // read.
-        size_t page_size = sysconf(_SC_PAGE_SIZE);
+        size_t page_size = (size_t)sysconf(_SC_PAGE_SIZE);
         start = ((addr + (page_size - 1)) & ~(page_size - 1)) - addr;
         if (start == 0 || start >= XCD_THREAD_MEMORY_BYTES_TO_DUMP)
             skip_2nd_read = 1;
@@ -219,8 +224,8 @@ static int xcd_thread_record_memory_by_addr(xcd_thread_t *self, xcd_recorder_t *
         // into a readable map. Only requires one extra read because a map has
         // to contain at least one page, and the total number of bytes to dump
         // is smaller than a page.
-        size_t bytes2 = xcd_util_ptrace_read(self->pid, addr + start + bytes, (uint8_t *)(data) + bytes,
-                                             sizeof(data) - bytes - start);
+        size_t bytes2 = xcd_util_ptrace_read(self->pid, (uintptr_t)(addr + start + bytes), (uint8_t *)(data) + bytes,
+                                             (size_t)(sizeof(data) - bytes - start));
         bytes += bytes2;
         if(bytes2 > 0 && bytes % sizeof(uintptr_t) != 0)
             bytes &= ~(sizeof(uintptr_t) - 1);
@@ -228,7 +233,7 @@ static int xcd_thread_record_memory_by_addr(xcd_thread_t *self, xcd_recorder_t *
     uintptr_t *data_ptr = data;
     uint8_t *ptr;
     size_t current = 0;
-    size_t total_bytes = start + bytes;
+    size_t total_bytes = (size_t)(start + bytes);
     size_t i, j, k;
     char ascii[XCD_THREAD_MEMORY_BYTES_PER_LINE + 1];
     size_t ascii_idx = 0;
@@ -238,14 +243,14 @@ static int xcd_thread_record_memory_by_addr(xcd_thread_t *self, xcd_recorder_t *
     {
         ascii_idx = 0;
         
-        line_len = snprintf(line, sizeof(line), "    %0"XCC_UTIL_FMT_ADDR, addr);
+        line_len = (size_t)snprintf(line, sizeof(line), "    %0"XCC_UTIL_FMT_ADDR, addr);
         addr += XCD_THREAD_MEMORY_BYTES_PER_LINE;
 
         for(i = 0; i < XCD_THREAD_MEMORY_BYTES_PER_LINE / sizeof(uintptr_t); i++)
         {
             if(current >= start && current + sizeof(uintptr_t) <= total_bytes)
             {
-                line_len += snprintf(line + line_len, sizeof(line) - line_len, " %0"XCC_UTIL_FMT_ADDR, *data_ptr);
+                line_len += (size_t)snprintf(line + line_len, sizeof(line) - line_len, " %0"XCC_UTIL_FMT_ADDR, *data_ptr);
                 
                 // Fill out the ascii string from the data.
                 ptr = (uint8_t *)data_ptr;
@@ -253,7 +258,7 @@ static int xcd_thread_record_memory_by_addr(xcd_thread_t *self, xcd_recorder_t *
                 {
                     if(*ptr >= 0x20 && *ptr < 0x7f)
                     {
-                        ascii[ascii_idx++] = *ptr;
+                        ascii[ascii_idx++] = (char)(*ptr);
                     }
                     else
                     {
@@ -264,9 +269,9 @@ static int xcd_thread_record_memory_by_addr(xcd_thread_t *self, xcd_recorder_t *
             }
             else
             {
-                line_len += snprintf(line + line_len, sizeof(line) - line_len, " ");
+                line_len += (size_t)snprintf(line + line_len, sizeof(line) - line_len, " ");
                 for(k = 0; k < sizeof(uintptr_t) * 2; k++)
-                    line_len += snprintf(line + line_len, sizeof(line) - line_len, "-");
+                    line_len += (size_t)snprintf(line + line_len, sizeof(line) - line_len, "-");
                 for(k = 0; k < sizeof(uintptr_t); k++)
                     ascii[ascii_idx++] = '.';
             }
@@ -274,25 +279,27 @@ static int xcd_thread_record_memory_by_addr(xcd_thread_t *self, xcd_recorder_t *
         }
         ascii[ascii_idx] = '\0';
 
-        if(0 != (r = xcd_recorder_print(recorder, "%s  %s\n", line, ascii))) return r;
+        if(0 != (r = xcc_util_write_format(log_fd, "%s  %s\n", line, ascii))) return r;
     }
 
-    if(0 != (r = xcd_recorder_write(recorder, "\n"))) return r;
+    if(0 != (r = xcc_util_write_str(log_fd, "\n"))) return r;
 
     return 0;
 }
 
-int xcd_thread_record_memory(xcd_thread_t *self, xcd_recorder_t *recorder)
+int xcd_thread_record_memory(xcd_thread_t *self, int log_fd)
 {
     xcd_regs_label_t *labels;
     size_t            labels_count;
     size_t            i;
     int               r;
 
+    if(XCD_THREAD_STATUS_OK != self->status) return 0; //ignore
+
     xcd_regs_get_labels(&labels, &labels_count);
     
     for(i = 0; i < labels_count; i++)
-        if(0 != (r = xcd_thread_record_memory_by_addr(self, recorder, labels[i].name,
+        if(0 != (r = xcd_thread_record_memory_by_addr(self, log_fd, labels[i].name,
                                                       (uintptr_t)(self->regs.r[labels[i].idx])))) return r;
 
     return 0;

@@ -31,6 +31,7 @@
 #include <dirent.h>
 #include <string.h>
 #include <regex.h>
+#include <ctype.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -41,6 +42,7 @@
 #include "xcc_errno.h"
 #include "xcc_util.h"
 #include "xcc_b64.h"
+#include "xcc_meminfo.h"
 #include "xcd_log.h"
 #include "xcd_process.h"
 #include "xcd_thread.h"
@@ -48,7 +50,6 @@
 #include "xcd_regs.h"
 #include "xcd_util.h"
 #include "xcd_sys.h"
-#include "xcd_meminfo.h"
 
 typedef struct xcd_thread_info
 {
@@ -57,6 +58,8 @@ typedef struct xcd_thread_info
 } xcd_thread_info_t;
 typedef TAILQ_HEAD(xcd_thread_info_queue, xcd_thread_info,) xcd_thread_info_queue_t;
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpadded"
 struct xcd_process
 {
     pid_t                    pid;
@@ -68,6 +71,7 @@ struct xcd_process
     size_t                   nthds;
     xcd_maps_t              *maps;
 };
+#pragma clang diagnostic pop
 
 static int xcd_process_load_threads(xcd_process_t *self)
 {
@@ -150,11 +154,10 @@ int xcd_process_load_info(xcd_process_t *self)
 {
     int                r;
     xcd_thread_info_t *thd;
-    char               buf[128];
+    char               buf[256];
     
-    if(0 != xcc_util_get_process_name(self->pid, buf, sizeof(buf)) ||
-       NULL == (self->pname = strdup(xcc_util_trim(buf))))
-        self->pname = "<unknown>";
+    xcc_util_get_process_name(self->pid, buf, sizeof(buf));
+    if(NULL == (self->pname = strdup(buf))) self->pname = "unknown";
 
     TAILQ_FOREACH(thd, &(self->thds), link)
     {
@@ -175,14 +178,14 @@ int xcd_process_load_info(xcd_process_t *self)
     return 0;
 }
 
-static int xcd_process_record_signal_info(xcd_process_t *self, xcd_recorder_t *recorder)
+static int xcd_process_record_signal_info(xcd_process_t *self, int log_fd)
 {
     //fault addr
     char addr_desc[64];
     if(xcc_util_signal_has_si_addr(self->si))
     {
         void *addr = self->si->si_addr;
-        if (self->si->si_signo == SIGILL)
+        if(self->si->si_signo == SIGILL)
         {
             uint32_t instruction = 0;
             xcd_util_ptrace_read(self->pid, (uintptr_t)addr, &instruction, sizeof(instruction));
@@ -205,132 +208,129 @@ static int xcd_process_record_signal_info(xcd_process_t *self, xcd_recorder_t *r
         snprintf(sender_desc, sizeof(sender_desc), " from pid %d, uid %d", self->si->si_pid, self->si->si_uid);
     }
 
-    return xcd_recorder_print(recorder, "signal %d (%s), code %d (%s%s), fault addr %s\n",
-                              self->si->si_signo, xcc_util_get_signame(self->si),
-                              self->si->si_code, xcc_util_get_sigcodename(self->si),
-                              sender_desc, addr_desc);
+    return xcc_util_write_format(log_fd, "signal %d (%s), code %d (%s%s), fault addr %s\n",
+                                 self->si->si_signo, xcc_util_get_signame(self->si),
+                                 self->si->si_code, xcc_util_get_sigcodename(self->si),
+                                 sender_desc, addr_desc);
 }
 
-static int xcd_process_record_fds(xcd_process_t *self, xcd_recorder_t *recorder)
+static int xcd_process_get_abort_message_29(xcd_process_t *self, char *buf, size_t buf_len)
 {
-    char             buf[128];
-    char             path[512];
-    DIR             *dir = NULL;
-    struct dirent   *ent;
-    int              fd;
-    ssize_t          len;
-    size_t           total = 0;
-    int              r = 0;
+    //
+    // struct abort_msg_t {
+    //     size_t size;
+    //     char msg[0];
+    // };
+    //
+    // struct magic_abort_msg_t {
+    //     uint64_t magic1;
+    //     uint64_t magic2;
+    //     abort_msg_t msg;
+    // };
+    //
+    // ...
+    // size_t size = sizeof(magic_abort_msg_t) + strlen(msg) + 1;
+    // ...
+    //
 
-    if(0 != (r = xcd_recorder_write(recorder, "open files:\n"))) return r;
+    int r;
 
-    snprintf(buf, sizeof(buf), "/proc/%d/fd", self->pid);
-    if(NULL == (dir = opendir(buf))) goto end;
-    
-    while(NULL != (ent = readdir(dir)))
-    {
-        //get the fd
-        if('\0' == ent->d_name[0]) continue;
-        if(0 == strcmp(ent->d_name, ".")) continue;
-        if(0 == strcmp(ent->d_name, "..")) continue;
-        if(0 != xcc_util_atoi(ent->d_name, &fd)) continue;
-        if(fd < 0) continue;
+    //get abort_msg_t *p
+    uintptr_t p = xcd_maps_find_abort_msg(self->maps);
+    if(0 == p) return XCC_ERRNO_NOTFND;
+    p += (sizeof(uint64_t) * 2);
 
-        //count
-        total++;
-        if(total > 1024) continue;
+    //get size
+    size_t size = 0;
+    if(0 != (r = xcd_util_ptrace_read_fully(self->pid, p, &size, sizeof(size_t)))) return r;
+    if(size < (sizeof(uint64_t) * 2 + sizeof(size_t) + 1 + 1)) return XCC_ERRNO_NOTFND;
+    XCD_LOG_DEBUG("PROCESS: abort_msg, size = %zu", size);
 
-        //read link of the path
-        snprintf(buf, sizeof(buf), "/proc/%d/fd/%d", self->pid, fd);
-        len = readlink(buf, path, sizeof(path) - 1);
-        if(len <= 0 || len > (ssize_t)(sizeof(path) - 1))
-            strncpy(path, "???", sizeof(path));
-        else
-            path[len] = '\0';
+    //get strlen(msg)
+    size -= (sizeof(uint64_t) * 2 + sizeof(size_t) + 1);
 
-        //dump
-        if(0 != (r = xcd_recorder_print(recorder, "    fd %d: %s\n", fd, path))) goto clean;
-    }
+    //get p->msg
+    if(size > buf_len) size = buf_len;
+    if(0 != (r = xcd_util_ptrace_read_fully(self->pid, p + sizeof(size_t), buf, size))) return r;
 
- end:
-    if(total > 1024)
-        if(0 != (r = xcd_recorder_write(recorder, "    ......\n"))) goto clean;
-    if(0 != (r = xcd_recorder_print(recorder, "    (number of FDs: %zu)\n", total))) goto clean;
-    if(0 != (r = xcd_recorder_write(recorder, "\n"))) goto clean;
-    
- clean:
-    if(NULL != dir) closedir(dir);
-    return r;
+    return 0;
 }
 
-static int xcd_process_record_logcat_buffer(xcd_process_t *self, xcd_recorder_t *recorder,
-                                            const char *buffer, unsigned int lines, char priority,
-                                            int api_level)
+static int xcd_process_get_abort_message_14(xcd_process_t *self, char *buf, size_t buf_len)
 {
-    FILE *fp;
-    char  cmd[128];
-    char  buf[1025];
-    int   with_pid;
-    char  pid_filter[64] = "";
-    char  pid_label[32] = "";
-    int   r = 0;
+    //
+    // struct abort_msg_t {
+    //     size_t size;
+    //     char msg[0];
+    // };
+    //
+    // abort_msg_t** __abort_message_ptr;
+    //
+    // ......
+    // size_t size = sizeof(abort_msg_t) + strlen(msg) + 1;
+    // ......
+    //
 
-    //Since Android 7.0 Nougat (API level 24), logcat has --pid filter option.
-    with_pid = (api_level >= 24 ? 1 : 0);
+    int r;
 
-    if(with_pid)
+    //get abort_msg_t ***ppp (&__abort_message_ptr)
+    uintptr_t ppp = 0;
+    ppp = xcd_maps_find_pc(self->maps, XCC_UTIL_LIBC, XCC_UTIL_LIBC_ABORT_MSG_PTR);
+    if(0 == ppp) return XCC_ERRNO_NOTFND;
+    XCD_LOG_DEBUG("PROCESS: abort_msg, ppp = %"PRIxPTR, ppp);
+
+    //get abort_msg_t **pp (__abort_message_ptr)
+    uintptr_t pp = 0;
+    if(0 != (r = xcd_util_ptrace_read_fully(self->pid, ppp, &pp, sizeof(uintptr_t)))) return r;
+    if(0 == pp) return XCC_ERRNO_NOTFND;
+    XCD_LOG_DEBUG("PROCESS: abort_msg, pp = %"PRIxPTR, pp);
+
+    //get abort_msg_t *p (*__abort_message_ptr)
+    uintptr_t p = 0;
+    if(0 != (r = xcd_util_ptrace_read_fully(self->pid, pp, &p, sizeof(uintptr_t)))) return r;
+    if(0 == p) return XCC_ERRNO_NOTFND;
+    XCD_LOG_DEBUG("PROCESS: abort_msg, p = %"PRIxPTR, p);
+
+    //get p->size
+    size_t size = 0;
+    if(0 != (r = xcd_util_ptrace_read_fully(self->pid, p, &size, sizeof(size_t)))) return r;
+    if(size < (sizeof(size_t) + 1 + 1)) return XCC_ERRNO_NOTFND;
+    XCD_LOG_DEBUG("PROCESS: abort_msg, size = %zu", size);
+
+    //get strlen(msg)
+    size -= (sizeof(size_t) + 1);
+
+    //get p->msg
+    if(size > buf_len) size = buf_len;
+    if(0 != (r = xcd_util_ptrace_read_fully(self->pid, p + sizeof(size_t), buf, size))) return r;
+
+    return 0;
+}
+
+static int xcd_process_record_abort_message(xcd_process_t *self, int log_fd, int api_level)
+{
+    char msg[256 + 1];
+    memset(msg, 0, sizeof(msg));
+
+    if(api_level >= 29)
     {
-        //API level >= 24, filtered by --pid option
-        snprintf(pid_filter, sizeof(pid_filter), "--pid %d ", self->pid);
+        if(0 != xcd_process_get_abort_message_29(self, msg, sizeof(msg) - 1)) return 0;
     }
     else
     {
-        //API level < 24, filtered by ourself, so we need to read more lines
-        lines = (unsigned int)(lines * 1.2);
-        snprintf(pid_label, sizeof(pid_label), " %d ", self->pid);
+        if(0 != xcd_process_get_abort_message_14(self, msg, sizeof(msg) - 1)) return 0;
     }
-    
-    snprintf(cmd, sizeof(cmd), "/system/bin/logcat -b %s -d -v threadtime -t %u %s*:%c",
-             buffer, lines, pid_filter, priority);
 
-    if(0 != (r = xcd_recorder_print(recorder, "--------- tail end of log %s (%s)\n", buffer, cmd))) return r;
-
-    if(NULL != (fp = popen(cmd, "r")))
+    //format
+    size_t i;
+    for(i = 0; i < strlen(msg); i++)
     {
-        buf[sizeof(buf) - 1] = '\0';
-        while(NULL != fgets(buf, sizeof(buf) - 1, fp))
-            if(with_pid || NULL != strstr(buf, pid_label))
-                if(0 != (r = xcd_recorder_write(recorder, buf))) break;
-        pclose(fp);
+        if(isspace(msg[i]) && ' ' != msg[i])
+            msg[i] = ' ';
     }
-    
-    return r;
-}
 
-static int xcd_process_record_logcat(xcd_process_t *self, xcd_recorder_t *recorder,
-                                     unsigned int logcat_system_lines,
-                                     unsigned int logcat_events_lines,
-                                     unsigned int logcat_main_lines,
-                                     int api_level)
-{
-    int r;
-    
-    if(0 == logcat_system_lines && 0 == logcat_events_lines && 0 == logcat_main_lines) return 0;
-    
-    if(0 != (r = xcd_recorder_write(recorder, "logcat:\n"))) return r;
-
-    if(logcat_main_lines > 0)
-        if(0 != (r = xcd_process_record_logcat_buffer(self, recorder, "main", logcat_main_lines, 'D', api_level))) return r;
-    
-    if(logcat_system_lines > 0)
-        if(0 != (r = xcd_process_record_logcat_buffer(self, recorder, "system", logcat_system_lines, 'W', api_level))) return r;
-
-    if(logcat_events_lines > 0)
-        if(0 != (r = xcd_process_record_logcat_buffer(self, recorder, "events", logcat_events_lines, 'I', api_level))) return r;
-
-    if(0 != (r = xcd_recorder_write(recorder, "\n"))) return r;
-
-    return 0;
+    //write
+    return xcc_util_write_format(log_fd, "Abort message: '%s'\n", msg);
 }
 
 static regex_t *xcd_process_build_whitelist_regex(char *dump_all_threads_whitelist, size_t *re_cnt)
@@ -386,17 +386,25 @@ static int xcd_process_if_need_dump(char *tname, regex_t *re, size_t re_cnt)
     return 0;
 }
 
-int xcd_process_record(xcd_process_t *self, xcd_recorder_t *recorder,
-                       unsigned int logcat_system_lines, unsigned int logcat_events_lines, unsigned int logcat_main_lines,
-                       int dump_map, int dump_fds, int dump_all_threads,
-                       int dump_all_threads_count_max, char *dump_all_threads_whitelist,
+int xcd_process_record(xcd_process_t *self,
+                       int log_fd,
+                       unsigned int logcat_system_lines,
+                       unsigned int logcat_events_lines,
+                       unsigned int logcat_main_lines,
+                       int dump_elf_hash,
+                       int dump_map,
+                       int dump_fds,
+                       int dump_network_info,
+                       int dump_all_threads,
+                       unsigned int dump_all_threads_count_max,
+                       char *dump_all_threads_whitelist,
                        int api_level)
 {
     int                r = 0;
     xcd_thread_info_t *thd;
     regex_t           *re = NULL;
     size_t             re_cnt = 0;
-    int                thd_dumped = 0;
+    unsigned int       thd_dumped = 0;
     int                thd_matched_regex = 0;
     int                thd_ignored_by_limit = 0;
     
@@ -404,20 +412,22 @@ int xcd_process_record(xcd_process_t *self, xcd_recorder_t *recorder,
     {
         if(thd->t.tid == self->crash_tid)
         {
-            if(0 != (r = xcd_thread_record_info(&(thd->t), recorder, self->pname))) return r;
-            if(0 != (r = xcd_process_record_signal_info(self, recorder))) return r;
-            if(0 != (r = xcd_thread_record_regs(&(thd->t), recorder))) return r;
+            if(0 != (r = xcd_thread_record_info(&(thd->t), log_fd, self->pname))) return r;
+            if(0 != (r = xcd_process_record_signal_info(self, log_fd))) return r;
+            if(0 != (r = xcd_process_record_abort_message(self, log_fd, api_level))) return r;
+            if(0 != (r = xcd_thread_record_regs(&(thd->t), log_fd))) return r;
             if(0 == xcd_thread_load_frames(&(thd->t), self->maps))
             {
-                if(0 != (r = xcd_thread_record_backtrace(&(thd->t), recorder))) return r;
-                if(0 != (r = xcd_thread_record_buildid(&(thd->t), recorder))) return r;
-                if(0 != (r = xcd_thread_record_stack(&(thd->t), recorder))) return r;
-                if(0 != (r = xcd_thread_record_memory(&(thd->t), recorder))) return r;
+                if(0 != (r = xcd_thread_record_backtrace(&(thd->t), log_fd))) return r;
+                if(0 != (r = xcd_thread_record_buildid(&(thd->t), log_fd, dump_elf_hash, xcc_util_signal_has_si_addr(self->si) ? (uintptr_t)self->si->si_addr : 0))) return r;
+                if(0 != (r = xcd_thread_record_stack(&(thd->t), log_fd))) return r;
+                if(0 != (r = xcd_thread_record_memory(&(thd->t), log_fd))) return r;
             }
-            if(dump_map) if(0 != (r = xcd_maps_record(self->maps, recorder))) return r;
-            if(0 != (r = xcd_process_record_logcat(self, recorder, logcat_system_lines, logcat_events_lines, logcat_main_lines, api_level))) return r;
-            if(dump_fds) if(0 != (r = xcd_process_record_fds(self, recorder))) return r;
-            if(0 != (r = xcd_meminfo_record(recorder, self->pid))) return r;
+            if(dump_map) if(0 != (r = xcd_maps_record(self->maps, log_fd))) return r;
+            if(0 != (r = xcc_util_record_logcat(log_fd, self->pid, api_level, logcat_system_lines, logcat_events_lines, logcat_main_lines))) return r;
+            if(dump_fds) if(0 != (r = xcc_util_record_fds(log_fd, self->pid))) return r;
+            if(dump_network_info) if(0 != (r = xcc_util_record_network_info(log_fd, self->pid, api_level))) return r;
+            if(0 != (r = xcc_meminfo_record(log_fd, self->pid))) return r;
 
             break;
         }
@@ -445,13 +455,13 @@ int xcd_process_record(xcd_process_t *self, xcd_recorder_t *recorder,
                 continue;
             }
 
-            if(0 != (r = xcd_recorder_write(recorder, XCC_UTIL_THREAD_SEP))) goto end;
-            if(0 != (r = xcd_thread_record_info(&(thd->t), recorder, self->pname))) goto end;
-            if(0 != (r = xcd_thread_record_regs(&(thd->t), recorder))) goto end;
+            if(0 != (r = xcc_util_write_str(log_fd, XCC_UTIL_THREAD_SEP))) goto end;
+            if(0 != (r = xcd_thread_record_info(&(thd->t), log_fd, self->pname))) goto end;
+            if(0 != (r = xcd_thread_record_regs(&(thd->t), log_fd))) goto end;
             if(0 == xcd_thread_load_frames(&(thd->t), self->maps))
             {
-                if(0 != (r = xcd_thread_record_backtrace(&(thd->t), recorder))) goto end;
-                if(0 != (r = xcd_thread_record_stack(&(thd->t), recorder))) goto end;
+                if(0 != (r = xcd_thread_record_backtrace(&(thd->t), log_fd))) goto end;
+                if(0 != (r = xcd_thread_record_stack(&(thd->t), log_fd))) goto end;
             }
             thd_dumped++;
         }
@@ -461,16 +471,16 @@ int xcd_process_record(xcd_process_t *self, xcd_recorder_t *recorder,
     if(self->nthds > 1)
     {
         if(0 == thd_dumped)
-            if(0 != (r = xcd_recorder_write(recorder, XCC_UTIL_THREAD_SEP))) goto ret;
+            if(0 != (r = xcc_util_write_str(log_fd, XCC_UTIL_THREAD_SEP))) goto ret;
 
-        if(0 != (r = xcd_recorder_print(recorder, "total threads (exclude the crashed thread): %zu\n", self->nthds - 1))) goto ret;
+        if(0 != (r = xcc_util_write_format(log_fd, "total threads (exclude the crashed thread): %zu\n", self->nthds - 1))) goto ret;
         if(NULL != re && re_cnt > 0)
-            if(0 != (r = xcd_recorder_print(recorder, "threads matched whitelist: %d\n", thd_matched_regex))) goto ret;
+            if(0 != (r = xcc_util_write_format(log_fd, "threads matched whitelist: %d\n", thd_matched_regex))) goto ret;
         if(dump_all_threads_count_max > 0)
-            if(0 != (r = xcd_recorder_print(recorder, "threads ignored by max count limit: %d\n", thd_ignored_by_limit))) goto ret;
-        if(0 != (r = xcd_recorder_print(recorder, "dumped threads: %zu\n", thd_dumped))) goto ret;
+            if(0 != (r = xcc_util_write_format(log_fd, "threads ignored by max count limit: %d\n", thd_ignored_by_limit))) goto ret;
+        if(0 != (r = xcc_util_write_format(log_fd, "dumped threads: %u\n", thd_dumped))) goto ret;
         
-        if(0 != (r = xcd_recorder_write(recorder, XCC_UTIL_THREAD_END))) goto ret;
+        if(0 != (r = xcc_util_write_str(log_fd, XCC_UTIL_THREAD_END))) goto ret;
     }
     
  ret:

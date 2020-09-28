@@ -19,29 +19,24 @@
 // SOFTWARE.
 //
 
-// Created by caikelun on 2019-03-07.
+// Created by caikelun on 2019-08-16.
 
-#ifndef XCD_RECORDER_H
-#define XCD_RECORDER_H 1
+#ifndef XC_DL_H
+#define XC_DL_H 1
 
 #include <stdint.h>
 #include <sys/types.h>
-#include <stdarg.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct xcd_recorder xcd_recorder_t;
+typedef struct xc_dl xc_dl_t;
 
-int xcd_recorder_create(xcd_recorder_t **self, const char *pathname);
-void xcd_recorder_destroy(xcd_recorder_t **self);
+xc_dl_t *xc_dl_create(const char *pathname);
+void xc_dl_destroy(xc_dl_t **self);
 
-int xcd_recorder_get_fd(xcd_recorder_t *self);
-
-int xcd_recorder_write(xcd_recorder_t *self, const char *str);
-int xcd_recorder_print(xcd_recorder_t *self, const char *format, ...);
-int xcd_recorder_vprint(xcd_recorder_t *self, const char *format, va_list ap);
+void *xc_dl_sym(xc_dl_t *self, const char *symbol);
 
 #ifdef __cplusplus
 }

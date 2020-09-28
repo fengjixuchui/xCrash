@@ -24,9 +24,7 @@ package xcrash;
 
 import android.text.TextUtils;
 
-import java.io.BufferedWriter;
 import java.io.File;
-import java.io.FileWriter;
 import java.io.FilenameFilter;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -54,35 +52,19 @@ public class TombstoneManager {
      * @param content Section content.
      * @return Return true if successful, false otherwise.
      */
-    @SuppressWarnings({"unused", "UnusedReturnValue", "TryFinallyCanBeTryWithResources"})
+    @SuppressWarnings({"unused", "UnusedReturnValue"})
     public static boolean appendSection(String logPath, String key, String content) {
         if (TextUtils.isEmpty(logPath) || TextUtils.isEmpty(key) || content == null) {
             return false;
         }
 
-        BufferedWriter writer = null;
-        try {
-            writer = new BufferedWriter(new FileWriter(logPath, true));
-            writer.write("\n\n" + key + ":\n");
-            writer.write(content);
-            writer.write("\n\n");
-            return true;
-        } catch (Exception ignored) {
-            return false;
-        } finally {
-            if (writer != null) {
-                try {
-                    writer.close();
-                } catch (Exception ignored) {
-                }
-            }
-        }
+        return FileManager.getInstance().appendText(logPath, "\n\n" + key + ":\n" + content + "\n\n");
     }
 
     /**
-     * Determines if the current crash log file recorded a Java exception.
+     * Determines if the current log file recorded a Java exception.
      *
-     * @param log Object of the crash log file.
+     * @param log Object of the log file.
      * @return Return true if YES, false otherwise.
      */
     @SuppressWarnings("unused")
@@ -91,14 +73,25 @@ public class TombstoneManager {
     }
 
     /**
-     * Determines if the current crash log file recorded a native crash.
+     * Determines if the current log file recorded a native crash.
      *
-     * @param log Object of the crash log file.
+     * @param log Object of the log file.
      * @return Return true if YES, false otherwise.
      */
     @SuppressWarnings("unused")
     public static boolean isNativeCrash(File log) {
         return log.getName().endsWith(Util.nativeLogSuffix);
+    }
+
+    /**
+     * Determines if the current log file recorded an ANR.
+     *
+     * @param log Object of the log file.
+     * @return Return true if YES, false otherwise.
+     */
+    @SuppressWarnings("unused")
+    public static boolean isAnr(File log) {
+        return log.getName().endsWith(Util.anrLogSuffix);
     }
 
     /**
@@ -122,13 +115,49 @@ public class TombstoneManager {
     }
 
     /**
-     * Get all Java exception and native crash log files.
+     * Get all ANR log files.
      *
-     * @return An array of File objects of the Java exception and native crash log files.
+     * @return An array of File objects of the ANR log files.
+     */
+    @SuppressWarnings("unused")
+    public static File[] getAnrTombstones() {
+        return getTombstones(new String[]{Util.anrLogSuffix});
+    }
+
+    /**
+     * Get all Java exception, native crash and ANR log files.
+     *
+     * @return An array of File objects of the Java exception, native crash and ANR log files.
      */
     @SuppressWarnings("unused")
     public static File[] getAllTombstones() {
-        return getTombstones(new String[]{Util.javaLogSuffix, Util.nativeLogSuffix});
+        return getTombstones(new String[]{Util.javaLogSuffix, Util.nativeLogSuffix, Util.anrLogSuffix});
+    }
+
+    /**
+     * Delete the tombstone file.
+     *
+     * <p>Note: When you use the placeholder file feature by {@link XCrash.InitParameters#setPlaceholderCountMax(int)},
+     * please always use this method to delete tombstone files.
+     *
+     * @param file The tombstone file object.
+     * @return Return true if successful, false otherwise.
+     */
+    public static boolean deleteTombstone(File file) {
+        return FileManager.getInstance().recycleLogFile(file);
+    }
+
+    /**
+     * Delete the tombstone file.
+     *
+     * <p>Note: When you use the placeholder file feature by {@link XCrash.InitParameters#setPlaceholderCountMax(int)},
+     * please always use this method to delete tombstone files.
+     *
+     * @param path The path of the tombstone file.
+     * @return Return true if successful, false otherwise.
+     */
+    public static boolean deleteTombstone(String path) {
+        return FileManager.getInstance().recycleLogFile(new File(path));
     }
 
     /**
@@ -152,13 +181,23 @@ public class TombstoneManager {
     }
 
     /**
-     * Delete all Java exception and native crash log files.
+     * Delete all ANR log files.
+     *
+     * @return Return true if successful, false otherwise.
+     */
+    @SuppressWarnings("unused")
+    public static boolean clearAnrTombstones() {
+        return clearTombstones(new String[]{Util.anrLogSuffix});
+    }
+
+    /**
+     * Delete all Java exception, native crash and ANR log files.
      *
      * @return Return true if successful, false otherwise.
      */
     @SuppressWarnings("unused")
     public static boolean clearAllTombstones() {
-        return clearTombstones(new String[]{Util.javaLogSuffix, Util.nativeLogSuffix});
+        return clearTombstones(new String[]{Util.javaLogSuffix, Util.nativeLogSuffix, Util.anrLogSuffix});
     }
 
     private static File[] getTombstones(final String[] logPrefixes) {
@@ -168,7 +207,7 @@ public class TombstoneManager {
         }
 
         File dir = new File(logDir);
-        if (!dir.exists()) {
+        if (!dir.exists() || !dir.isDirectory()) {
             return new File[0];
         }
 
@@ -186,6 +225,9 @@ public class TombstoneManager {
                 return false;
             }
         });
+        if (files == null) {
+            return new File[0];
+        }
 
         //sort
         Arrays.sort(files, new Comparator<File>() {
@@ -205,7 +247,7 @@ public class TombstoneManager {
         }
 
         File dir = new File(logDir);
-        if (!dir.exists()) {
+        if (!dir.exists() || !dir.isDirectory()) {
             return false;
         }
 
@@ -223,10 +265,13 @@ public class TombstoneManager {
                 return false;
             }
         });
+        if (files == null) {
+            return false;
+        }
 
         boolean success = true;
         for (File f : files) {
-            if (!f.delete()) {
+            if (!FileManager.getInstance().recycleLogFile(f)) {
                 success = false;
             }
         }

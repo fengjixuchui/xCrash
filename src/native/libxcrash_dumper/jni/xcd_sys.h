@@ -27,14 +27,25 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include "xcc_util.h"
-#include "xcd_recorder.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-int xcd_sys_record(xcd_recorder_t *recorder, uint64_t start_time, uint64_t crash_time,
-                   const char *app_id, const char *app_version, xcc_util_build_prop_t *props, size_t nthds);
+int xcd_sys_record(int fd,
+                   long time_zone,
+                   uint64_t start_time,
+                   uint64_t crash_time,
+                   const char *app_id,
+                   const char *app_version,
+                   int api_level,
+                   const char *os_version,
+                   const char *kernel_version,
+                   const char *abi_list,
+                   const char *manufacturer,
+                   const char *brand,
+                   const char *model,
+                   const char *build_fingerprint);
 
 #ifdef __cplusplus
 }

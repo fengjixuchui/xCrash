@@ -19,38 +19,59 @@
 // SOFTWARE.
 //
 
-// Created by caikelun on 2019-03-07.
+// Created by caikelun on 2019-05-30.
+package xcrash;
 
-#ifndef XC_RECORDER_H
-#define XC_RECORDER_H 1
+import android.util.Log;
 
-#include <stdint.h>
-#include <sys/types.h>
+class DefaultLogger implements ILogger {
+    @Override
+    public void v(String tag, String msg) {
+        Log.v(tag, msg);
+    }
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+    @Override
+    public void v(String tag, String msg, Throwable tr) {
+        Log.v(tag, msg, tr);
+    }
 
-typedef struct xc_recorder xc_recorder_t;
+    @Override
+    public void d(String tag, String msg) {
+        Log.d(tag, msg);
+    }
 
-int xcd_recorder_create(xc_recorder_t **self, uint64_t start_time, const char *app_version,
-                        const char *log_dir, const char *log_prefix, const char *log_suffix,
-                        size_t log_cnt_max);
-void xcd_recorder_destroy(xc_recorder_t **self);
+    @Override
+    public void d(String tag, String msg, Throwable tr) {
+        Log.d(tag, msg, tr);
+    }
 
-int xc_recorder_create_log(xc_recorder_t *self);
-int xc_recorder_create_log_ok(xc_recorder_t *self);
-char *xc_recorder_get_log_pathname(xc_recorder_t *self);
+    @Override
+    public void i(String tag, String msg) {
+        Log.i(tag, msg);
+    }
 
-int xc_recorder_log_err(xc_recorder_t *self, const char *errmsg, int errnum);
+    @Override
+    public void i(String tag, String msg, Throwable tr) {
+        Log.i(tag, msg, tr);
+    }
 
-int xc_recorder_open(xc_recorder_t *self, int *fd);
-void xc_recorder_close(xc_recorder_t *self, int fd);
+    @Override
+    public void w(String tag, String msg) {
+        Log.w(tag, msg);
+    }
 
-int xc_recorder_check_backtrace_valid(xc_recorder_t *self);
+    @Override
+    public void w(String tag, String msg, Throwable tr) {
+        Log.w(tag, msg, tr);
+    }
 
-#ifdef __cplusplus
+    @Override
+    public void e(String tag, String msg) {
+        Log.e(tag, msg);
+    }
+
+    @Override
+    public void e(String tag, String msg, Throwable tr) {
+        Log.e(tag, msg, tr);
+    }
 }
-#endif
-
-#endif

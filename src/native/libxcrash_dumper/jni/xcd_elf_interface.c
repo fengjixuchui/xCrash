@@ -38,6 +38,8 @@
 #include "xcd_util.h"
 #include "queue.h"
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpadded"
 typedef struct xcd_elf_load
 {
     uintptr_t vaddr;
@@ -45,8 +47,11 @@ typedef struct xcd_elf_load
     size_t    size;
     TAILQ_ENTRY(xcd_elf_load,) link;
 } xcd_elf_load_t;
+#pragma clang diagnostic pop
 typedef TAILQ_HEAD(xcd_elf_load_queue, xcd_elf_load,) xcd_elf_load_queue_t;
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpadded"
 typedef struct xcd_elf_symbols
 {
     size_t sym_offset;
@@ -56,12 +61,27 @@ typedef struct xcd_elf_symbols
     size_t str_end;
     TAILQ_ENTRY(xcd_elf_symbols,) link;
 } xcd_elf_symbols_t;
+#pragma clang diagnostic pop
 typedef TAILQ_HEAD(xcd_elf_symbols_queue, xcd_elf_symbols,) xcd_elf_symbols_queue_t;
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpadded"
+typedef struct xcd_elf_strtab
+{
+    size_t addr;
+    size_t offset;
+    TAILQ_ENTRY(xcd_elf_strtab,) link;
+} xcd_elf_strtab_t;
+#pragma clang diagnostic pop
+typedef TAILQ_HEAD(xcd_elf_strtab_queue, xcd_elf_strtab,) xcd_elf_strtab_queue_t;
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpadded"
 struct xcd_elf_interface
 {
     pid_t                    pid;
     xcd_memory_t            *memory;
+    char                    *so_name;
     uintptr_t                load_bias;
     int                      is_gnu;
 
@@ -70,6 +90,9 @@ struct xcd_elf_interface
 
     //symbols (.dynsym with .dynstr, .symtab with .strtab)
     xcd_elf_symbols_queue_t  symbolsq;
+
+    //string tables
+    xcd_elf_strtab_queue_t   strtabq;
 
     //.note.gnu.build-id
     size_t                   build_id_offset;
@@ -95,7 +118,12 @@ struct xcd_elf_interface
     //.gnu_debugdata
     size_t                   gnu_debugdata_offset;
     size_t                   gnu_debugdata_size;
+
+    //.dynamic
+    size_t                   dynamic_offset;
+    size_t                   dynamic_size;
 };
+#pragma clang diagnostic pop
 
 static int xcd_elf_interface_check_valid(ElfW(Ehdr) *ehdr)
 {
@@ -185,6 +213,10 @@ static int xcd_elf_interface_read_program_headers(xcd_elf_interface_t *self, Elf
             self->arm_exidx_offset = phdr.p_offset;
             self->arm_exidx_size   = phdr.p_memsz;
             break;
+        case PT_DYNAMIC:
+            self->dynamic_offset = phdr.p_offset;
+            self->dynamic_size   = phdr.p_memsz;
+            break;
         default:
             break;
         }
@@ -208,6 +240,7 @@ static int xcd_elf_interface_read_section_headers(xcd_elf_interface_t *self, Elf
     size_t             sec_offset = 0;
     size_t             sec_size   = 0;
     xcd_elf_symbols_t *symbols, *symbols_tmp;
+    xcd_elf_strtab_t  *strtab, *strtab_tmp;
     char               name[128];
     int                r;
 
@@ -268,6 +301,18 @@ static int xcd_elf_interface_read_section_headers(xcd_elf_interface_t *self, Elf
                 TAILQ_INSERT_TAIL(&(self->symbolsq), symbols, link);
                 break;
             }
+        case SHT_STRTAB:
+            {
+                if(NULL == (strtab = malloc(sizeof(xcd_elf_strtab_t))))
+                {
+                    r = XCC_ERRNO_NOMEM;
+                    goto err;
+                }
+                strtab->addr = shdr.sh_addr;
+                strtab->offset = shdr.sh_offset;
+                TAILQ_INSERT_TAIL(&(self->strtabq), strtab, link);
+                break;
+            }
         case SHT_PROGBITS:
             {
                 if(shdr.sh_name >= sec_size) continue;
@@ -312,6 +357,11 @@ static int xcd_elf_interface_read_section_headers(xcd_elf_interface_t *self, Elf
         TAILQ_REMOVE(&(self->symbolsq), symbols, link);
         free(symbols);
     }
+    TAILQ_FOREACH_SAFE(strtab, &(self->strtabq), link, strtab_tmp)
+    {
+        TAILQ_REMOVE(&(self->strtabq), strtab, link);
+        free(strtab);
+    }
     return r;
 }
 
@@ -332,6 +382,7 @@ int xcd_elf_interface_create(xcd_elf_interface_t **self, pid_t pid, xcd_memory_t
     (*self)->memory = memory;
     TAILQ_INIT(&((*self)->loads));
     TAILQ_INIT(&((*self)->symbolsq));
+    TAILQ_INIT(&((*self)->strtabq));
 
     //read program headers, save and return load_bias
     if(0 != (r = xcd_elf_interface_read_program_headers(*self, &ehdr, load_bias)))
@@ -465,12 +516,12 @@ int xcd_elf_interface_arm_exidx_step(xcd_elf_interface_t *self, uintptr_t step_p
 int xcd_elf_interface_get_function_info(xcd_elf_interface_t *self, uintptr_t addr, char **name, size_t *name_offset)
 {
     xcd_elf_symbols_t *symbols;
-    size_t offset;
-    size_t start_offset;
-    size_t end_offset;
-    size_t str_offset;
-    ElfW(Sym) sym;
-    char buf[512];
+    size_t             offset;
+    size_t             start_offset;
+    size_t             end_offset;
+    size_t             str_offset;
+    ElfW(Sym)          sym;
+    char               buf[512];
 
     TAILQ_FOREACH(symbols, &(self->symbolsq), link)
     {
@@ -488,7 +539,7 @@ int xcd_elf_interface_get_function_info(xcd_elf_interface_t *self, uintptr_t add
             str_offset = symbols->str_offset + sym.st_name;
             if(str_offset >= symbols->str_end) continue;
             
-            if(0 != xcd_memory_read_string(self->memory, str_offset, buf, sizeof(buf), symbols->str_end - str_offset)) break;
+            if(0 != xcd_memory_read_string(self->memory, str_offset, buf, sizeof(buf), symbols->str_end - str_offset)) continue;
             if(NULL == (*name = strdup(buf))) break;
 
             return 0;
@@ -497,6 +548,40 @@ int xcd_elf_interface_get_function_info(xcd_elf_interface_t *self, uintptr_t add
 
     *name = NULL;
     *name_offset = 0;
+    return XCC_ERRNO_NOTFND;
+}
+
+int xcd_elf_interface_get_symbol_addr(xcd_elf_interface_t *self, const char *name, uintptr_t *addr)
+{
+    xcd_elf_symbols_t *symbols;
+    size_t             offset;
+    size_t             str_offset;
+    ElfW(Sym)          sym;
+    char               buf[512];
+
+    TAILQ_FOREACH(symbols, &(self->symbolsq), link)
+    {
+        for(offset = symbols->sym_offset; offset < symbols->sym_end; offset += symbols->sym_entry_size)
+        {
+            //read .symtab / .dynsym
+            if(0 != xcd_memory_read_fully(self->memory, offset, &sym, sizeof(sym))) break;
+            if(sym.st_shndx == SHN_UNDEF) continue;
+
+            //read .strtab / .dynstr
+            str_offset = symbols->str_offset + sym.st_name;
+            if(str_offset >= symbols->str_end) continue;
+            if(0 != xcd_memory_read_string(self->memory, str_offset, buf, sizeof(buf), symbols->str_end - str_offset)) continue;
+
+            //compare symbol name
+            if(0 != strcmp(name, buf)) continue;
+
+            //found it
+            *addr = sym.st_value;
+            return 0;
+        }
+    }
+
+    *addr = 0;
     return XCC_ERRNO_NOTFND;
 }
 
@@ -515,9 +600,59 @@ int xcd_elf_interface_get_build_id(xcd_elf_interface_t *self, uint8_t *build_id,
     if(nhdr.n_descsz > build_id_len) return XCC_ERRNO_NOSPACE;
 
     //read .note.gnu.build-id data
-    addr = self->build_id_offset + sizeof(nhdr) + ((nhdr.n_namesz + 3) & ~3); //skip the name (should be "GNU\0": 0x47 0x4e 0x55 0x00)
+    addr = self->build_id_offset + sizeof(nhdr) + ((nhdr.n_namesz + 3) & (~(unsigned int)3)); //skip the name (should be "GNU\0": 0x47 0x4e 0x55 0x00)
     if(0 != (r = xcd_memory_read_fully(self->memory, addr, build_id, nhdr.n_descsz))) return r;
 
     if(NULL != build_id_len_ret) *build_id_len_ret = nhdr.n_descsz;
     return 0;
+}
+
+char *xcd_elf_interface_get_so_name(xcd_elf_interface_t *self)
+{
+    uintptr_t         offset;
+    ElfW(Dyn)         dyn;
+    xcd_elf_strtab_t *strtab;
+    uintptr_t         strtab_addr = 0;
+    uintptr_t         strtab_size = 0;
+    uintptr_t         soname_offset = 0;
+    char              buf[256] = "\0";
+
+    if(0 == self->dynamic_offset || 0 == self->dynamic_size) goto err;
+    if(NULL != self->so_name) return self->so_name;
+
+    for(offset = self->dynamic_offset; offset < self->dynamic_offset + self->dynamic_size; offset += sizeof(dyn))
+    {
+        if(0 != xcd_memory_read_fully(self->memory, offset, &dyn, sizeof(dyn))) goto err;
+        if(DT_NULL == dyn.d_tag) break;
+        switch(dyn.d_tag)
+        {
+        case DT_STRTAB:
+            strtab_addr = dyn.d_un.d_ptr;
+            break;
+        case DT_STRSZ:
+            strtab_size = (uintptr_t)(dyn.d_un.d_val);
+            break;
+        case DT_SONAME:
+            soname_offset = (uintptr_t)(dyn.d_un.d_val);
+            break;
+        default:
+            break;
+        }
+    }
+
+    TAILQ_FOREACH(strtab, &(self->strtabq), link)
+    {
+        if(strtab->addr == strtab_addr)
+        {
+            soname_offset += strtab->offset;
+            if(soname_offset >= strtab->offset + strtab_size) goto err;
+            if(0 != xcd_memory_read_string(self->memory, soname_offset, buf, sizeof(buf), strtab->offset + strtab_size - soname_offset)) goto err;
+            if(NULL == (self->so_name = strdup(buf))) goto err;
+            return self->so_name;
+        }
+    }
+
+ err:
+    self->so_name = "";
+    return self->so_name;
 }

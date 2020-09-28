@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 #include "queue.h"
 #include "xcc_errno.h"
 #include "xcc_util.h"
@@ -32,7 +33,11 @@
 #include "xcd_map.h"
 #include "xcd_util.h"
 #include "xcd_log.h"
-#include "xcd_recorder.h"
+
+#define XCD_MAPS_ABORT_MSG_NAME    "[anon:abort message]"
+#define XCD_MAPS_ABORT_MSG_FLAGS   (PROT_READ | PROT_WRITE)
+#define XCD_MAPS_ABORT_MSG_MAGIC_1 0xb18e40886ac388f0ULL
+#define XCD_MAPS_ABORT_MSG_MAGIC_2 0xc6dfba755a1de0b5ULL
 
 typedef struct xcd_maps_item
 {
@@ -41,10 +46,14 @@ typedef struct xcd_maps_item
 } xcd_maps_item_t;
 typedef TAILQ_HEAD(xcd_maps_item_queue, xcd_maps_item,) xcd_maps_item_queue_t;
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpadded"
 struct xcd_maps
 {
     xcd_maps_item_queue_t maps;
+    pid_t                 pid;
 };
+#pragma clang diagnostic pop
 
 static int xcd_maps_parse_line(char *line, xcd_maps_item_t **mi)
 {
@@ -75,6 +84,7 @@ int xcd_maps_create(xcd_maps_t **self, pid_t pid)
 
     if(NULL == (*self = malloc(sizeof(xcd_maps_t)))) return XCC_ERRNO_NOMEM;
     TAILQ_INIT(&((*self)->maps));
+    (*self)->pid = pid;
 
     snprintf(buf, sizeof(buf), "/proc/%d/maps", pid);
     if(NULL == (fp = fopen(buf, "r"))) return XCC_ERRNO_SYS;
@@ -108,7 +118,7 @@ void xcd_maps_destroy(xcd_maps_t **self)
     *self = NULL;
 }
 
-xcd_map_t *xcd_maps_find(xcd_maps_t *self, uintptr_t pc)
+xcd_map_t *xcd_maps_find_map(xcd_maps_t *self, uintptr_t pc)
 {
     xcd_maps_item_t *mi;
 
@@ -119,17 +129,149 @@ xcd_map_t *xcd_maps_find(xcd_maps_t *self, uintptr_t pc)
     return NULL;
 }
 
-int xcd_maps_record(xcd_maps_t *self, xcd_recorder_t *recorder)
+xcd_map_t *xcd_maps_get_prev_map(xcd_maps_t *self, xcd_map_t *cur_map)
+{
+    (void)self;
+
+    xcd_maps_item_t *cur_mi = (xcd_maps_item_t *)cur_map;
+    xcd_maps_item_t *prev_mi = TAILQ_PREV(cur_mi, xcd_maps_item_queue, link);
+
+    return (NULL == prev_mi ? NULL : &(prev_mi->map));
+}
+
+uintptr_t xcd_maps_find_abort_msg(xcd_maps_t *self)
 {
     xcd_maps_item_t *mi;
-    int              r;
+    uintptr_t        p;
+    uint64_t         magic;
 
-    if(0 != (r = xcd_recorder_write(recorder, "memory map:\n"))) return r;
-                     
     TAILQ_FOREACH(mi, &(self->maps), link)
-        if(0 != (r = xcd_map_record(&(mi->map), recorder))) return r;
+    {
+        if(NULL != mi->map.name && 0 == strcmp(mi->map.name, XCD_MAPS_ABORT_MSG_NAME) &&
+           XCD_MAPS_ABORT_MSG_FLAGS == mi->map.flags)
+        {
+            p = mi->map.start;
+            if(0 != xcd_util_ptrace_read_fully(self->pid, p, &magic, sizeof(uint64_t))) continue;
+            if(XCD_MAPS_ABORT_MSG_MAGIC_1 != magic) continue;
 
-    if(0 != (r = xcd_recorder_write(recorder, "\n"))) return r;
+            p += sizeof(uint64_t);
+            if(0 != xcd_util_ptrace_read_fully(self->pid, p, &magic, sizeof(uint64_t))) continue;
+            if(XCD_MAPS_ABORT_MSG_MAGIC_2 != magic) continue;
+
+            return mi->map.start;
+        }
+    }
+
+    return 0;
+}
+
+uintptr_t xcd_maps_find_pc(xcd_maps_t *self, const char *pathname, const char *symbol)
+{
+    xcd_maps_item_t *mi;
+    xcd_elf_t       *elf;
+    uintptr_t        addr = 0;
+
+    TAILQ_FOREACH(mi, &(self->maps), link)
+    {
+        if(NULL != mi->map.name && 0 == strcmp(mi->map.name, pathname))
+        {
+            //get ELF
+            if(NULL == (elf = xcd_map_get_elf(&(mi->map), self->pid, (void *)self))) return 0;
+
+            //get rel addr (offset)
+            if(0 != xcd_elf_get_symbol_addr(elf, symbol, &addr)) return 0;
+
+            return xcd_map_get_abs_pc(&(mi->map), addr, self->pid, (void *)self);
+        }
+    }
+
+    return 0; //not found
+}
+
+int xcd_maps_record(xcd_maps_t *self, int log_fd)
+{
+    int              r;
+    xcd_maps_item_t *mi;
+    uintptr_t        size;
+    uintptr_t        total_size = 0;
+    size_t           max_size = 0;
+    size_t           max_offset = 0;
+    size_t           width_size = 0;
+    size_t           width_offset = 0;
+    uintptr_t        load_bias = 0;
+    char             load_bias_buf[64] = "\0";
+    char            *name = "";
+    char            *prev_name = NULL;
+
+    //get width of size and offset columns
+    TAILQ_FOREACH(mi, &(self->maps), link)
+    {
+        size = mi->map.end - mi->map.start;
+        if(size > max_size) max_size = size;
+        if(mi->map.offset > max_offset) max_offset = mi->map.offset;
+    }
+    while(0 != max_size)
+    {
+        max_size /= 0x10;
+        width_size++;
+    }
+    if(0 == width_size) width_size = 1;
+    while(0 != max_offset)
+    {
+        max_offset /= 0x10;
+        width_offset++;
+    }
+    if(0 == width_offset) width_offset = 1;
+
+    //dump
+    if(0 != (r = xcc_util_write_str(log_fd, "memory map:\n"))) return r;
+    TAILQ_FOREACH(mi, &(self->maps), link)
+    {
+        //get load_bias
+        if(NULL != mi->map.elf)
+        {
+            if(0 != (load_bias = xcd_elf_get_load_bias(mi->map.elf)))
+                snprintf(load_bias_buf, sizeof(load_bias_buf), " (load base 0x%"PRIxPTR")", load_bias);
+        }
+        else
+        {
+            load_bias_buf[0] = '\0';
+        }
+
+        //get name
+        if(NULL != mi->map.name)
+        {
+            if(NULL == prev_name)
+                name = mi->map.name;
+            else if(0 == strcmp(prev_name, mi->map.name))
+                name = ">"; //same as prev line
+            else
+                name = mi->map.name;
+        }
+        else
+        {
+            name = "";
+        }
+
+        //save prev name
+        prev_name = mi->map.name;
+
+        //update total size
+        size = mi->map.end - mi->map.start;
+        total_size += size;
+
+        if(0 != (r = xcc_util_write_format(log_fd,
+                                           "    %0"XCC_UTIL_FMT_ADDR"-%0"XCC_UTIL_FMT_ADDR" %c%c%c %*"PRIxPTR" %*"PRIxPTR" %s%s\n",
+                                           mi->map.start, mi->map.end,
+                                           mi->map.flags & PROT_READ ? 'r' : '-',
+                                           mi->map.flags & PROT_WRITE ? 'w' : '-',
+                                           mi->map.flags & PROT_EXEC ? 'x' : '-',
+                                           width_offset, mi->map.offset,
+                                           width_size, size,
+                                           name, load_bias_buf))) return r;
+    }
+    if(0 != (r = xcc_util_write_format(log_fd, "    TOTAL SIZE: 0x%"PRIxPTR"K (%"PRIuPTR"K)\n\n",
+                                       total_size / 1024, total_size / 1024))) return r;
 
     return 0;
 }

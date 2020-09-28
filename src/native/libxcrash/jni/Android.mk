@@ -2,21 +2,24 @@ LOCAL_PATH := $(call my-dir)
 
 include $(CLEAR_VARS)
 LOCAL_MODULE           := test
-LOCAL_CFLAGS           := -std=c11 -Wall -Wextra -Werror -O0
-LOCAL_C_INCLUDES       := $(LOCAL_PATH)
+LOCAL_CFLAGS           := -std=c11 -Weverything -Werror -O0 -flto
+LOCAL_C_INCLUDES       := $(LOCAL_PATH) $(LOCAL_PATH)/../../common
 LOCAL_SRC_FILES        := xc_test.c
 include $(BUILD_STATIC_LIBRARY)
 
 include $(CLEAR_VARS)
 LOCAL_MODULE           := xcrash
-LOCAL_CFLAGS           := -std=c11 -Wall -Wextra -Werror -fvisibility=hidden
-LOCAL_C_INCLUDES       := $(LOCAL_PATH) $(LOCAL_PATH)/../../common
+LOCAL_CFLAGS           := -std=c11 -Weverything -Werror -fvisibility=hidden -Oz -flto
+LOCAL_LDFLAGS          := -flto
+LOCAL_LDLIBS           := -ldl -llog
 LOCAL_STATIC_LIBRARIES := test
-LOCAL_LDLIBS           := -llog -ldl
-LOCAL_SRC_FILES        := xc_core.c     \
+LOCAL_C_INCLUDES       := $(LOCAL_PATH) $(LOCAL_PATH)/../../common  $(LOCAL_PATH)/../../libxcrash_dumper/jni
+LOCAL_SRC_FILES        := xc_jni.c      \
+                          xc_common.c   \
+                          xc_crash.c    \
+                          xc_trace.c    \
+                          xc_dl.c       \
                           xc_fallback.c \
-                          xc_recorder.c \
-                          xc_jni.c      \
                           xc_util.c     \
                           $(wildcard $(LOCAL_PATH)/../../common/*.c)
 include $(BUILD_SHARED_LIBRARY)

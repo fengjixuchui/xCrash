@@ -27,16 +27,17 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
-#include "xcd_meminfo.h"
-#include "xcd_recorder.h"
+#include "xcc_util.h"
+#include "xcc_libc_support.h"
+#include "xcc_meminfo.h"
 
-#define XCD_MEMINFO_DELETE_STR     " (deleted)"
-#define XCD_MEMINFO_DELETE_STR_LEN 10
-#define XCD_MEMINFO_HEAD_FMT       "%13s %8s %8s %8s %8s %8s %8s %8s\n"
-#define XCD_MEMINFO_DATA_FMT       "%13s %8zu %8zu %8zu %8zu %8zu %8zu %8zu\n"
-#define XCD_MEMINFO_SUM_HEAD_FMT   "%21s %8s\n"
-#define XCD_MEMINFO_SUM_DATA_FMT   "%21s %8zu\n"
-#define XCD_MEMINFO_SUM_DATA2_FMT  "%21s %8zu %21s %8zu\n"
+#define XCC_MEMINFO_DELETE_STR     " (deleted)"
+#define XCC_MEMINFO_DELETE_STR_LEN 10
+#define XCC_MEMINFO_HEAD_FMT       "%13s %8s %8s %8s %8s %8s %8s %8s\n"
+#define XCC_MEMINFO_DATA_FMT       "%13s %8zu %8zu %8zu %8zu %8zu %8zu %8zu\n"
+#define XCC_MEMINFO_SUM_HEAD_FMT   "%21s %8s\n"
+#define XCC_MEMINFO_SUM_DATA_FMT   "%21s %8zu\n"
+#define XCC_MEMINFO_SUM_DATA2_FMT  "%21s %8zu %21s %8zu\n"
 
 typedef struct
 {
@@ -48,9 +49,9 @@ typedef struct
     size_t shared_clean;
     size_t swapped_out;
     size_t swapped_out_pss;
-} xcd_meminfo_t;
+} xcc_meminfo_t;
 
-const char *xcd_meminfo_label[] =
+static const char *xcc_meminfo_label[] =
 {
     "Native Heap",
     "Dalvik Heap",
@@ -140,7 +141,7 @@ enum {
     _NUM_EXCLUSIVE_HEAP = HEAP_UNKNOWN + 1
 };
 
-static void xcd_meminfo_load(FILE *fp, xcd_meminfo_t *stats, int *found_swap_pss)
+static void xcc_meminfo_load(FILE *fp, xcc_meminfo_t *stats, int *found_swap_pss)
 {
     char       line[1024];
     size_t     len;
@@ -148,7 +149,8 @@ static void xcd_meminfo_load(FILE *fp, xcd_meminfo_t *stats, int *found_swap_pss
     
     uintptr_t  start = 0, end = 0, prev_end = 0;
     char      *name;
-    int        name_len, name_pos;
+    size_t     name_len, name_pos;
+    int        pos = 0;
 
     size_t     pss;
     size_t     swappable_pss;
@@ -183,12 +185,14 @@ static void xcd_meminfo_load(FILE *fp, xcd_meminfo_t *stats, int *found_swap_pss
         if (len < 1) return;
         line[--len] = '\0';
         
-        if(sscanf(line, "%"SCNxPTR"-%"SCNxPTR" %*s %*x %*x:%*x %*d%n", &start, &end, &name_pos) != 2)
+        if(sscanf(line, "%"SCNxPTR"-%"SCNxPTR" %*s %*x %*x:%*x %*d%n", &start, &end, &pos) != 2)
         {
             skip = 1;
         }
         else
         {
+            name_pos = (size_t)pos;
+            
             //get name and name length
             while(isspace(line[name_pos]))
                 name_pos += 1;
@@ -196,10 +200,10 @@ static void xcd_meminfo_load(FILE *fp, xcd_meminfo_t *stats, int *found_swap_pss
             name_len = strlen(name);
             
             //trim the end of the line if it is " (deleted)"
-            if(name_len > XCD_MEMINFO_DELETE_STR_LEN &&
-               0 == strcmp(name + name_len - XCD_MEMINFO_DELETE_STR_LEN, XCD_MEMINFO_DELETE_STR))
+            if(name_len > XCC_MEMINFO_DELETE_STR_LEN &&
+               0 == strcmp(name + name_len - XCC_MEMINFO_DELETE_STR_LEN, XCC_MEMINFO_DELETE_STR))
             {
-                name_len -= XCD_MEMINFO_DELETE_STR_LEN;
+                name_len -= XCC_MEMINFO_DELETE_STR_LEN;
                 name[name_len] = '\0';
             }
 
@@ -408,7 +412,7 @@ static void xcd_meminfo_load(FILE *fp, xcd_meminfo_t *stats, int *found_swap_pss
                 {
                     sharing_proportion = (pss - private_clean - private_dirty) / (shared_clean + shared_dirty);
                 }
-                swappable_pss = (sharing_proportion * shared_clean) + private_clean;
+                swappable_pss = (size_t)((sharing_proportion * shared_clean) + private_clean);
             }
             else
             {
@@ -441,23 +445,44 @@ static void xcd_meminfo_load(FILE *fp, xcd_meminfo_t *stats, int *found_swap_pss
     }
 }
 
-int xcd_meminfo_record(xcd_recorder_t *recorder, pid_t pid)
+static int xcc_meminfo_record_sys(int log_fd)
+{
+    return xcc_util_record_sub_section_from(log_fd, "/proc/meminfo", " System Summary (From: /proc/meminfo)\n", 0);
+}
+
+static int xcc_meminfo_record_proc_status(int log_fd, pid_t pid)
+{
+    char  path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+
+    return xcc_util_record_sub_section_from(log_fd, path, " Process Status (From: /proc/PID/status)\n", 0);
+}
+
+static int xcc_meminfo_record_proc_limits(int log_fd, pid_t pid)
+{
+    char  path[64];
+    snprintf(path, sizeof(path), "/proc/%d/limits", pid);
+
+    return xcc_util_record_sub_section_from(log_fd, path, " Process Limits (From: /proc/PID/limits)\n", 0);
+}
+
+int xcc_meminfo_record(int log_fd, pid_t pid)
 {
     char           path[64];
     FILE          *fp = NULL;
-    xcd_meminfo_t  stats[_NUM_HEAP];
-    xcd_meminfo_t  total;
+    xcc_meminfo_t  stats[_NUM_HEAP];
+    xcc_meminfo_t  total;
     int            found_swap_pss = 0;
     size_t         i;
     int            r = 0;
 
-    memset(stats, 0, sizeof(stats));
-    memset(&total, 0, sizeof(total));
+    xcc_libc_support_memset(stats, 0, sizeof(stats));
+    xcc_libc_support_memset(&total, 0, sizeof(total));
 
     //load memory info from /proc/pid/smaps
     snprintf(path, sizeof(path), "/proc/%d/smaps", pid);
     if(NULL == (fp = fopen(path, "r"))) return 0;
-    xcd_meminfo_load(fp, stats, &found_swap_pss);
+    xcc_meminfo_load(fp, stats, &found_swap_pss);
     fclose(fp);
 
     for(i = 0; i < _NUM_EXCLUSIVE_HEAP; i++)
@@ -473,10 +498,14 @@ int xcd_meminfo_record(xcd_recorder_t *recorder, pid_t pid)
     }
 
     //dump
-    if(0 != (r = xcd_recorder_write(recorder, "memory info:\n"))) return r;
-    if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_HEAD_FMT, "", "Pss", "Pss", "Shared", "Private", "Shared", "Private", found_swap_pss ? "SwapPss" : "Swap"))) return r;
-    if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_HEAD_FMT, "", "Total", "Clean", "Dirty", "Dirty", "Clean", "Clean", "Dirty"))) return r;
-    if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_HEAD_FMT, "", "------", "------", "------", "------", "------", "------", "------"))) return r;
+    if(0 != (r = xcc_util_write_str(log_fd, "memory info:\n"))) return r;
+    if(0 != (r = xcc_meminfo_record_sys(log_fd))) return r;
+    if(0 != (r = xcc_meminfo_record_proc_status(log_fd, pid))) return r;
+    if(0 != (r = xcc_meminfo_record_proc_limits(log_fd, pid))) return r;
+    if(0 != (r = xcc_util_write_str(log_fd, " Process Details (From: /proc/PID/smaps)\n"))) return r;
+    if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_HEAD_FMT, "", "Pss", "Pss", "Shared", "Private", "Shared", "Private", found_swap_pss ? "SwapPss" : "Swap"))) return r;
+    if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_HEAD_FMT, "", "Total", "Clean", "Dirty", "Dirty", "Clean", "Clean", "Dirty"))) return r;
+    if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_HEAD_FMT, "", "------", "------", "------", "------", "------", "------", "------"))) return r;
     for(i = 0; i < _NUM_EXCLUSIVE_HEAP; i++)
     {
         if(HEAP_NATIVE == i || HEAP_DALVIK == i || HEAP_UNKNOWN == i ||
@@ -484,85 +513,85 @@ int xcd_meminfo_record(xcd_recorder_t *recorder, pid_t pid)
            0 != stats[i].private_dirty || 0 != stats[i].shared_clean || 0 != stats[i].private_clean ||
            0 != (found_swap_pss ? stats[i].swapped_out_pss : stats[i].swapped_out))
         {
-            if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_DATA_FMT, xcd_meminfo_label[i],
-                                            stats[i].pss,
-                                            stats[i].swappable_pss,
-                                            stats[i].shared_dirty,
-                                            stats[i].private_dirty,
-                                            stats[i].shared_clean,
-                                            stats[i].private_clean,
-                                            found_swap_pss ? stats[i].swapped_out_pss : stats[i].swapped_out))) return r;
+            if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_DATA_FMT, xcc_meminfo_label[i],
+                                               stats[i].pss,
+                                               stats[i].swappable_pss,
+                                               stats[i].shared_dirty,
+                                               stats[i].private_dirty,
+                                               stats[i].shared_clean,
+                                               stats[i].private_clean,
+                                               found_swap_pss ? stats[i].swapped_out_pss : stats[i].swapped_out))) return r;
         }
     }
-    if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_DATA_FMT, "TOTAL",
-                                    total.pss,
-                                    total.swappable_pss,
-                                    total.shared_dirty,
-                                    total.private_dirty,
-                                    total.shared_clean,
-                                    total.private_clean,
-                                    found_swap_pss ? total.swapped_out_pss : total.swapped_out))) return r;
-    if(0 != (r = xcd_recorder_write(recorder, "-\n Dalvik Details\n"))) return r;
+    if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_DATA_FMT, "TOTAL",
+                                       total.pss,
+                                       total.swappable_pss,
+                                       total.shared_dirty,
+                                       total.private_dirty,
+                                       total.shared_clean,
+                                       total.private_clean,
+                                       found_swap_pss ? total.swapped_out_pss : total.swapped_out))) return r;
+    if(0 != (r = xcc_util_write_str(log_fd, "-\n Process Dalvik Details (From: /proc/PID/smaps)\n"))) return r;
     for(i = _NUM_EXCLUSIVE_HEAP; i < _NUM_HEAP; i++)
     {
         if(0 != stats[i].pss || 0 != stats[i].swappable_pss || 0 != stats[i].shared_dirty ||
            0 != stats[i].private_dirty || 0 != stats[i].shared_clean || 0 != stats[i].private_clean ||
            0 != (found_swap_pss ? stats[i].swapped_out_pss : stats[i].swapped_out))
         {
-            if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_DATA_FMT, xcd_meminfo_label[i],
-                                            stats[i].pss,
-                                            stats[i].swappable_pss,
-                                            stats[i].shared_dirty,
-                                            stats[i].private_dirty,
-                                            stats[i].shared_clean,
-                                            stats[i].private_clean,
-                                            found_swap_pss ? stats[i].swapped_out_pss : stats[i].swapped_out))) return r;
+            if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_DATA_FMT, xcc_meminfo_label[i],
+                                               stats[i].pss,
+                                               stats[i].swappable_pss,
+                                               stats[i].shared_dirty,
+                                               stats[i].private_dirty,
+                                               stats[i].shared_clean,
+                                               stats[i].private_clean,
+                                               found_swap_pss ? stats[i].swapped_out_pss : stats[i].swapped_out))) return r;
         }
     }
-    if(0 != (r = xcd_recorder_write(recorder, "-\n App Summary (From: /proc/PID/smaps)\n"))) return r;
-    if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_SUM_HEAD_FMT, "", "Pss(KB)"))) return r;
-    if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_SUM_HEAD_FMT, "", "------"))) return r;
-    if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_SUM_DATA_FMT, "Java Heap:",
-                                    stats[HEAP_DALVIK].private_dirty +
-                                    stats[HEAP_ART].private_dirty + stats[HEAP_ART].private_clean))) return r;
-    if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_SUM_DATA_FMT, "Native Heap:",
-                                    stats[HEAP_NATIVE].private_dirty))) return r;
-    if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_SUM_DATA_FMT, "Code:",
-                                    stats[HEAP_SO].private_dirty + stats[HEAP_SO].private_clean +
-                                    stats[HEAP_JAR].private_dirty + stats[HEAP_JAR].private_clean +
-                                    stats[HEAP_APK].private_dirty + stats[HEAP_APK].private_clean +
-                                    stats[HEAP_TTF].private_dirty + stats[HEAP_TTF].private_clean +
-                                    stats[HEAP_DEX].private_dirty + stats[HEAP_DEX].private_clean +
-                                    stats[HEAP_OAT].private_dirty + stats[HEAP_OAT].private_clean))) return r;
-    if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_SUM_DATA_FMT, "Stack:",
-                                    stats[HEAP_STACK].private_dirty))) return r;
-    if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_SUM_DATA_FMT, "Private Other:", 
-                                    stats[HEAP_DALVIK_OTHER].private_dirty + stats[HEAP_DALVIK_OTHER].private_clean +
-                                    stats[HEAP_CURSOR].private_dirty + stats[HEAP_CURSOR].private_clean +
-                                    stats[HEAP_ASHMEM].private_dirty + stats[HEAP_ASHMEM].private_clean +
-                                    stats[HEAP_GL_DEV].private_dirty + stats[HEAP_GL_DEV].private_clean +
-                                    stats[HEAP_UNKNOWN_DEV].private_dirty + stats[HEAP_UNKNOWN_DEV].private_clean +
-                                    stats[HEAP_UNKNOWN_MAP].private_dirty + stats[HEAP_UNKNOWN_MAP].private_clean +
-                                    stats[HEAP_UNKNOWN].private_dirty + stats[HEAP_UNKNOWN].private_clean))) return r;
-    if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_SUM_DATA_FMT, "System:",
-                                    total.pss - total.private_dirty - total.private_clean))) return r;
+    if(0 != (r = xcc_util_write_str(log_fd, "-\n Process Summary (From: /proc/PID/smaps)\n"))) return r;
+    if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_SUM_HEAD_FMT, "", "Pss(KB)"))) return r;
+    if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_SUM_HEAD_FMT, "", "------"))) return r;
+    if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_SUM_DATA_FMT, "Java Heap:",
+                                       stats[HEAP_DALVIK].private_dirty +
+                                       stats[HEAP_ART].private_dirty + stats[HEAP_ART].private_clean))) return r;
+    if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_SUM_DATA_FMT, "Native Heap:",
+                                       stats[HEAP_NATIVE].private_dirty))) return r;
+    if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_SUM_DATA_FMT, "Code:",
+                                       stats[HEAP_SO].private_dirty + stats[HEAP_SO].private_clean +
+                                       stats[HEAP_JAR].private_dirty + stats[HEAP_JAR].private_clean +
+                                       stats[HEAP_APK].private_dirty + stats[HEAP_APK].private_clean +
+                                       stats[HEAP_TTF].private_dirty + stats[HEAP_TTF].private_clean +
+                                       stats[HEAP_DEX].private_dirty + stats[HEAP_DEX].private_clean +
+                                       stats[HEAP_OAT].private_dirty + stats[HEAP_OAT].private_clean))) return r;
+    if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_SUM_DATA_FMT, "Stack:",
+                                       stats[HEAP_STACK].private_dirty))) return r;
+    if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_SUM_DATA_FMT, "Private Other:", 
+                                       stats[HEAP_DALVIK_OTHER].private_dirty + stats[HEAP_DALVIK_OTHER].private_clean +
+                                       stats[HEAP_CURSOR].private_dirty + stats[HEAP_CURSOR].private_clean +
+                                       stats[HEAP_ASHMEM].private_dirty + stats[HEAP_ASHMEM].private_clean +
+                                       stats[HEAP_GL_DEV].private_dirty + stats[HEAP_GL_DEV].private_clean +
+                                       stats[HEAP_UNKNOWN_DEV].private_dirty + stats[HEAP_UNKNOWN_DEV].private_clean +
+                                       stats[HEAP_UNKNOWN_MAP].private_dirty + stats[HEAP_UNKNOWN_MAP].private_clean +
+                                       stats[HEAP_UNKNOWN].private_dirty + stats[HEAP_UNKNOWN].private_clean))) return r;
+    if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_SUM_DATA_FMT, "System:",
+                                       total.pss - total.private_dirty - total.private_clean))) return r;
     if(found_swap_pss)
     {
-        if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_SUM_DATA2_FMT,
-                                        "TOTAL:",
-                                        total.pss,
-                                        "TOTAL SWAP PSS:",
-                                        total.swapped_out_pss))) return r;
+        if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_SUM_DATA2_FMT,
+                                           "TOTAL:",
+                                           total.pss,
+                                           "TOTAL SWAP PSS:",
+                                           total.swapped_out_pss))) return r;
     }
     else
     {
-        if(0 != (r = xcd_recorder_print(recorder, XCD_MEMINFO_SUM_DATA2_FMT,
-                                        "TOTAL:",
-                                        total.pss,
-                                        "TOTAL SWAP:",
-                                        total.swapped_out))) return r;
+        if(0 != (r = xcc_util_write_format(log_fd, XCC_MEMINFO_SUM_DATA2_FMT,
+                                           "TOTAL:",
+                                           total.pss,
+                                           "TOTAL SWAP:",
+                                           total.swapped_out))) return r;
     }
-    if(0 != (r = xcd_recorder_write(recorder, "\n"))) return r;
+    if(0 != (r = xcc_util_write_str(log_fd, "-\n\n"))) return r;
     
     return 0;
 }

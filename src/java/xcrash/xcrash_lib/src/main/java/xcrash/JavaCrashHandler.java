@@ -22,19 +22,14 @@
 // Created by caikelun on 2019-03-07.
 package xcrash;
 
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
 import java.io.File;
-import java.io.FileWriter;
-import java.io.FilenameFilter;
-import java.io.IOException;
-import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.io.RandomAccessFile;
 import java.io.StringWriter;
 import java.lang.Thread.UncaughtExceptionHandler;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -42,8 +37,8 @@ import java.util.Map;
 import java.util.regex.Pattern;
 
 import android.annotation.SuppressLint;
-import android.content.Context;
-import android.os.Build;
+import android.text.TextUtils;
+import android.os.Process;
 
 @SuppressLint("StaticFieldLeak")
 class JavaCrashHandler implements UncaughtExceptionHandler {
@@ -52,16 +47,17 @@ class JavaCrashHandler implements UncaughtExceptionHandler {
 
     private final Date startTime = new Date();
 
-    private Context ctx;
     private int pid;
     private String processName;
     private String appId;
     private String appVersion;
+    private boolean rethrow;
     private String logDir;
-    private int logCountMax;
     private int logcatSystemLines;
     private int logcatEventsLines;
     private int logcatMainLines;
+    private boolean dumpFds;
+    private boolean dumpNetworkInfo;
     private boolean dumpAllThreads;
     private int dumpAllThreadsCountMax;
     private String[] dumpAllThreadsWhiteList;
@@ -75,20 +71,21 @@ class JavaCrashHandler implements UncaughtExceptionHandler {
         return instance;
     }
 
-    void initialize(Context ctx, String appId, String appVersion, String logDir, int logCountMax,
+    void initialize(int pid, String processName, String appId, String appVersion, String logDir, boolean rethrow,
                     int logcatSystemLines, int logcatEventsLines, int logcatMainLines,
-                    boolean dumpAllThreads, int dumpAllThreadsCountMax, String[] dumpAllThreadsWhiteList,
+                    boolean dumpFds, boolean dumpNetworkInfo, boolean dumpAllThreads, int dumpAllThreadsCountMax, String[] dumpAllThreadsWhiteList,
                     ICrashCallback callback) {
-        this.ctx = ctx;
-        this.pid = android.os.Process.myPid();
-        this.processName = Util.getProcessName(ctx, this.pid);
+        this.pid = pid;
+        this.processName = (TextUtils.isEmpty(processName) ? "unknown" : processName);
         this.appId = appId;
         this.appVersion = appVersion;
+        this.rethrow = rethrow;
         this.logDir = logDir;
-        this.logCountMax = (logCountMax <= 0 ? 10 : logCountMax);
         this.logcatSystemLines = logcatSystemLines;
         this.logcatEventsLines = logcatEventsLines;
         this.logcatMainLines = logcatMainLines;
+        this.dumpFds = dumpFds;
+        this.dumpNetworkInfo = dumpNetworkInfo;
         this.dumpAllThreads = dumpAllThreads;
         this.dumpAllThreadsCountMax = dumpAllThreadsCountMax;
         this.dumpAllThreadsWhiteList = dumpAllThreadsWhiteList;
@@ -98,65 +95,102 @@ class JavaCrashHandler implements UncaughtExceptionHandler {
         try {
             Thread.setDefaultUncaughtExceptionHandler(this);
         } catch (Exception e) {
-            e.printStackTrace();
+            XCrash.getLogger().e(Util.TAG, "JavaCrashHandler setDefaultUncaughtExceptionHandler failed", e);
         }
     }
 
     @Override
     public void uncaughtException(Thread thread, Throwable throwable) {
-        handleException(thread, throwable);
-
         if (defaultHandler != null) {
-            defaultHandler.uncaughtException(thread, throwable);
+            Thread.setDefaultUncaughtExceptionHandler(defaultHandler);
+        }
+
+        try {
+            handleException(thread, throwable);
+        } catch (Exception e) {
+            XCrash.getLogger().e(Util.TAG, "JavaCrashHandler handleException failed", e);
+        }
+
+        if (this.rethrow) {
+            if (defaultHandler != null) {
+                defaultHandler.uncaughtException(thread, throwable);
+            }
+        } else {
+            ActivityMonitor.getInstance().finishAllActivities();
+            Process.killProcess(this.pid);
+            System.exit(10);
         }
     }
 
-    @SuppressWarnings("TryFinallyCanBeTryWithResources")
     private void handleException(Thread thread, Throwable throwable) {
         Date crashTime = new Date();
 
-        //get emergency
-        String emergency = getEmergency(crashTime, thread, throwable);
+        //notify the java crash
+        NativeHandler.getInstance().notifyJavaCrashed();
+        AnrHandler.getInstance().notifyJavaCrashed();
 
         //create log file
-        String logPath = createLogFile();
+        File logFile = null;
+        try {
+            String logPath = String.format(Locale.US, "%s/%s_%020d_%s__%s%s", logDir, Util.logPrefix, startTime.getTime() * 1000, appVersion, processName, Util.javaLogSuffix);
+            logFile = FileManager.getInstance().createLogFile(logPath);
+        } catch (Exception e) {
+            XCrash.getLogger().e(Util.TAG, "JavaCrashHandler createLogFile failed", e);
+        }
+
+        //get emergency
+        String emergency = null;
+        try {
+            emergency = getEmergency(crashTime, thread, throwable);
+        } catch (Exception e) {
+            XCrash.getLogger().e(Util.TAG, "JavaCrashHandler getEmergency failed", e);
+        }
 
         //write info to log file
-        if (logPath != null) {
-            BufferedWriter writer = null;
+        if (logFile != null) {
+            RandomAccessFile raf = null;
             try {
-                writer = new BufferedWriter(new FileWriter(logPath, false));
+                raf = new RandomAccessFile(logFile, "rws");
 
-                //write & flush emergency info
-                writer.write(emergency);
-                writer.flush();
+                //write emergency info
+                if (emergency != null) {
+                    raf.write(emergency.getBytes("UTF-8"));
+                }
 
                 //If we wrote the emergency info successfully, we don't need to return it from callback again.
                 emergency = null;
 
                 //write logcat
                 if (logcatMainLines > 0 || logcatSystemLines > 0 || logcatEventsLines > 0) {
-                    writer.write(getLogcat(pid));
-                    writer.flush();
+                    raf.write(Util.getLogcat(logcatMainLines, logcatSystemLines, logcatEventsLines).getBytes("UTF-8"));
+                }
+
+                //write fds
+                if (dumpFds) {
+                    raf.write(Util.getFds().getBytes("UTF-8"));
+                }
+
+                //write network info
+                if (dumpNetworkInfo) {
+                    raf.write(Util.getNetworkInfo().getBytes("UTF-8"));
                 }
 
                 //write memory info
-                writer.write("memory info:\n");
-                writer.write(Util.getMemoryInfo());
-                writer.write("\n");
-                writer.flush();
+                raf.write(Util.getMemoryInfo().getBytes("UTF-8"));
+
+                //write background / foreground
+                raf.write(("foreground:\n" + (ActivityMonitor.getInstance().isApplicationForeground() ? "yes" : "no") + "\n\n").getBytes("UTF-8"));
 
                 //write other threads info
                 if (dumpAllThreads) {
-                    writer.write(getOtherThreadsInfo(thread));
-                    writer.flush();
+                    raf.write(getOtherThreadsInfo(thread).getBytes("UTF-8"));
                 }
             } catch (Exception e) {
-                e.printStackTrace();
+                XCrash.getLogger().e(Util.TAG, "JavaCrashHandler write log file failed", e);
             } finally {
-                if (writer != null) {
+                if (raf != null) {
                     try {
-                        writer.close();
+                        raf.close();
                     } catch (Exception ignored) {
                     }
                 }
@@ -166,60 +200,66 @@ class JavaCrashHandler implements UncaughtExceptionHandler {
         //callback
         if (callback != null) {
             try {
-                callback.onCrash(logPath, emergency);
+                callback.onCrash(logFile == null ? null : logFile.getAbsolutePath(), emergency);
             } catch (Exception ignored) {
             }
         }
     }
 
-    @SuppressWarnings("ResultOfMethodCallIgnored")
-    private String createLogFile() {
-        //check and create dir
-        File dir = new File(logDir);
-        if (!dir.exists()) {
-            dir.mkdirs();
-        }
-        if (!dir.exists() || !dir.isDirectory()) {
-            return null;
-        }
+    private String getLibInfo(List<String> libPathList) {
+        StringBuilder sb = new StringBuilder();
+        for(String libPath : libPathList) {
+            File libFile = new File(libPath);
+            if (libFile.exists() && libFile.isFile()) {
+                String md5 = Util.getFileMD5(libFile);
 
-        //get all existing log files
-        File[] files = dir.listFiles(new FilenameFilter() {
-            @Override
-            public boolean accept(File dir, String name) {
-                return name.startsWith(Util.logPrefix + "_") && name.endsWith(Util.javaLogSuffix);
-            }
-        });
+                DateFormat timeFormatter = new SimpleDateFormat(Util.timeFormatterStr, Locale.US);
+                Date lastTime = new Date(libFile.lastModified());
 
-        //sort
-        Arrays.sort(files, new Comparator<File>() {
-            @Override
-            public int compare(File f1, File f2) {
-                return f1.getName().compareTo(f2.getName());
-            }
-        });
-
-        //delete extra files
-        if (files.length >= logCountMax) {
-            for (int i = 0; i < files.length - logCountMax + 1; i++) {
-                files[i].delete();
+                sb.append("    ").append(libPath).append("(BuildId: unknown. FileSize: ").append(libFile.length()).append(". LastModified: ")
+                        .append(timeFormatter.format(lastTime)).append(". MD5: ").append(md5).append(")\n");
+            } else {
+                sb.append("    ").append(libPath).append(" (Not found)\n");
             }
         }
 
-        //create new log file
-        String path = String.format(Locale.US, "%s/%s_%020d_%s__%s%s", logDir, Util.logPrefix, startTime.getTime() * 1000, appVersion, processName, Util.javaLogSuffix);
-        try {
-            new File(path).createNewFile();
-        } catch (Exception e) {
-            e.printStackTrace();
+        String libInfo = sb.toString();
+        return libInfo;
+    }
+
+    private String getBuildId(String stktrace) {
+        String buildId = "";
+        List<String> libPathList = new ArrayList<String>();
+        if (stktrace.contains("UnsatisfiedLinkError")) {
+            String libInfo = null;
+            String[] tempLibPathStr;
+            tempLibPathStr = stktrace.split("\""); // " is the delimiter
+            for (String libPathStr :  tempLibPathStr) {
+                if (libPathStr.isEmpty() || !libPathStr.endsWith(".so")) continue;
+
+                libPathList.add(libPathStr);
+
+                String libName = libPathStr.substring(libPathStr.lastIndexOf('/') + 1);
+
+                libPathList.add(XCrash.nativeLibDir + "/" + libName);
+                libPathList.add("/vendor/lib/" + libName);
+                libPathList.add("/vendor/lib64/" + libName);
+                libPathList.add("/system/lib/" + libName);
+                libPathList.add("/system/lib64/" + libName);
+
+                libInfo = getLibInfo(libPathList);
+            }
+
+            buildId = "build id:"
+                    + "\n"
+                    + libInfo
+                    + "\n";
         }
 
-        return path;
+        return buildId;
     }
 
     private String getEmergency(Date crashTime, Thread thread, Throwable throwable) {
-        //memory info
-        Util.MemoryInfo mi = Util.getMemoryInfo(ctx);
 
         //stack stace
         StringWriter sw = new StringWriter();
@@ -227,103 +267,13 @@ class JavaCrashHandler implements UncaughtExceptionHandler {
         throwable.printStackTrace(pw);
         String stacktrace = sw.toString();
 
-        return Util.sepHead + "\n"
-                + "Tombstone maker: '" + Version.fullVersion + "'\n"
-                + "Crash type: '" + Util.javaCrashType + "'\n"
-                + "Start time: '" + Util.timeFormatter.format(startTime) + "'\n"
-                + "Crash time: '" + Util.timeFormatter.format(crashTime) + "'\n"
-                + "App ID: '" + appId + "'\n"
-                + "App version: '" + appVersion + "'\n"
-                + "CPU loadavg: '" + Util.readFileLine("/proc/loadavg") + "'\n"
-                + "CPU online: '" + Util.readFileLine("/sys/devices/system/cpu/online") + "'\n"
-                + "CPU offline: '" + Util.readFileLine("/sys/devices/system/cpu/offline") + "'\n"
-                + "System memory total: '" + mi.systemMemoryTotalKb + " kB'\n"
-                + "System memory used: '" + mi.systemMemoryUsedKb + " kB'\n"
-                + "Number of threads: '" + Util.getNumberOfThreads(pid) + "'\n"
-                + "Rooted: '" + (Util.isRoot() ? "Yes" : "No") + "'\n"
-                + "API level: '" + Build.VERSION.SDK_INT + "'\n"
-                + "OS version: '" + Build.VERSION.RELEASE + "'\n"
-                + "ABI list: '" + Util.getAbiList() + "'\n"
-                + "Manufacturer: '" + Build.MANUFACTURER + "'\n"
-                + "Brand: '" + Build.BRAND + "'\n"
-                + "Model: '" + Build.MODEL + "'\n"
-                + "Build fingerprint: '" + Build.FINGERPRINT + "'\n"
-                + "pid: " + pid + ", tid: " + android.os.Process.myTid() + ", name: " + thread.getName() + "  >>> " + processName + " <<<\n"
+        return Util.getLogHeader(startTime, crashTime, Util.javaCrashType, appId, appVersion)
+                + "pid: " + pid + ", tid: " + Process.myTid() + ", name: " + thread.getName() + "  >>> " + processName + " <<<\n"
                 + "\n"
                 + "java stacktrace:\n"
                 + stacktrace
-                + "\n";
-    }
-
-    private String getLogcat(int pid) {
-        StringBuilder sb = new StringBuilder();
-
-        sb.append("logcat:\n");
-
-        if (logcatMainLines > 0) {
-            getLogcatByBufferName(sb, pid, "main", logcatMainLines, 'D');
-        }
-        if (logcatSystemLines > 0) {
-            getLogcatByBufferName(sb, pid, "system", logcatSystemLines, 'W');
-        }
-        if (logcatEventsLines > 0) {
-            getLogcatByBufferName(sb, pid, "events", logcatSystemLines, 'I');
-        }
-
-        sb.append("\n");
-
-        return sb.toString();
-    }
-
-    private void getLogcatByBufferName(StringBuilder sb, int pid, String bufferName, int lines, char priority) {
-        boolean withPid = (android.os.Build.VERSION.SDK_INT >= 24);
-        String pidString = Integer.toString(pid);
-        String pidLabel = " " + pidString + " ";
-
-        //command for ProcessBuilder
-        List<String> command = new ArrayList<String>();
-        command.add("/system/bin/logcat");
-        command.add("-b");
-        command.add(bufferName);
-        command.add("-d");
-        command.add("-v");
-        command.add("threadtime");
-        command.add("-t");
-        command.add(Integer.toString(withPid ? lines : (int) (lines * 1.2)));
-        if (withPid) {
-            command.add("--pid");
-            command.add(pidString);
-        }
-        command.add("*:" + priority);
-
-        //append the command line
-        Object[] commandArray = command.toArray();
-        if (commandArray != null) {
-            sb.append("--------- tail end of log ").append(bufferName);
-            sb.append(" (").append(android.text.TextUtils.join(" ", commandArray)).append(")\n");
-        }
-
-        //append logs
-        BufferedReader br = null;
-        String line;
-        try {
-            Process process = new ProcessBuilder().command(command).start();
-            br = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            while ((line = br.readLine()) != null) {
-                if (withPid || line.contains(pidLabel)) {
-                    sb.append(line).append("\n");
-                }
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        } finally {
-            if (br != null) {
-                try {
-                    br.close();
-                } catch (IOException ignored) {
-                }
-            }
-        }
+                + "\n"
+                + getBuildId(stacktrace);
     }
 
     private String getOtherThreadsInfo(Thread crashedThread) {
@@ -340,7 +290,7 @@ class JavaCrashHandler implements UncaughtExceptionHandler {
                 try {
                     whiteList.add(Pattern.compile(s));
                 } catch (Exception e) {
-                    e.printStackTrace();
+                    XCrash.getLogger().w(Util.TAG, "JavaCrashHandler pattern compile failed", e);
                 }
             }
         }

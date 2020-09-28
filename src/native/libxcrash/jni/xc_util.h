@@ -26,15 +26,14 @@
 
 #include <stdint.h>
 #include <sys/types.h>
-#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-struct tm *xca_util_time2tm(const time_t timev, long gmtoff, struct tm *result);
 char *xc_util_strdupcat(const char *s1, const char *s2);
 int xc_util_mkdirs(const char *dir);
+void xc_util_get_kernel_version(char *buf, size_t len);
 
 #ifdef __cplusplus
 }

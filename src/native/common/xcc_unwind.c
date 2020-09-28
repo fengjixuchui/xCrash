@@ -21,162 +21,50 @@
 
 // Created by caikelun on 2019-03-07.
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <inttypes.h>
-#include <signal.h>
+#include <stdint.h>
+#include <sys/types.h>
 #include <ucontext.h>
-#include <unwind.h>
-#include <dlfcn.h>
-#include <string.h>
 #include <android/log.h>
 #include "xcc_unwind.h"
-#include "xcc_errno.h"
-#include "xcc_util.h"
-#include "xcc_fmt.h"
+#include "xcc_unwind_libcorkscrew.h"
+#include "xcc_unwind_libunwind.h"
+#include "xcc_unwind_clang.h"
 
-#define XCC_UNWIND_FRAMES_MAX 128
-
-typedef struct
+void xcc_unwind_init(int api_level)
 {
-    uintptr_t *pc;
-    uintptr_t *sp;
-    size_t     cnt;
-} xcc_unwind_state_t;
-
-static _Unwind_Reason_Code xcc_unwind_callback(struct _Unwind_Context* context, void* arg)
-{
-    xcc_unwind_state_t* state = (xcc_unwind_state_t *)arg;
-    uintptr_t pc = _Unwind_GetIP(context);
-    uintptr_t sp = _Unwind_GetCFA(context);
-    
-    if(pc)
+#if defined(__arm__) || defined(__i386__)
+    if(api_level >= 16 && api_level <= 20)
     {
-        //If the pc and sp didn't change, then consider everything stopped.
-        if(state->cnt > 0 && pc == *(state->pc - 1) && sp == *(state->sp - 1))
-            return _URC_END_OF_STACK;
-        
-        *(state->pc) = pc;
-        *(state->sp) = sp;
-        state->pc++;
-        state->sp++;
-        
-        state->cnt++;
-        if(state->cnt >= XCC_UNWIND_FRAMES_MAX)
-            return _URC_END_OF_STACK;
+        xcc_unwind_libcorkscrew_init();
     }
-    return _URC_NO_REASON;
-}
-
-static int xcc_unwind_check_ignore_lib(const char *name, const char *ignore_lib)
-{
-    size_t name_len, ignore_lib_len;
+#endif
     
-    if(NULL == ignore_lib) return 0;
-
-    name_len = strlen(name);
-    ignore_lib_len = strlen(ignore_lib);
-    if(name_len < ignore_lib_len) return 0;
-
-    return (0 == memcmp((void *)(name + name_len - ignore_lib_len), (void *)ignore_lib, ignore_lib_len) ? 1 : 0);
+    if(api_level >= 21 && api_level <= 23)
+    {
+        xcc_unwind_libunwind_init();
+    }
 }
 
-int xcc_unwind_get(ucontext_t *uc, const char *ignore_lib, char *buf, size_t buf_len)
+size_t xcc_unwind_get(int api_level, siginfo_t *si, ucontext_t *uc, char *buf, size_t buf_len)
 {
-    uintptr_t           sig_pc = 0;
-    uintptr_t           pc_buf[XCC_UNWIND_FRAMES_MAX];
-    uintptr_t           sp_buf[XCC_UNWIND_FRAMES_MAX];
-    size_t              i, j;
-    uintptr_t           rel_pc;
-    const char         *name;
-    const char         *symbol;
-    uintptr_t           offset;
-    Dl_info             info;
-    xcc_unwind_state_t  state = {.pc = pc_buf, .sp = sp_buf, .cnt = 0};
-    char                line[1024];
-    size_t              len;
-    int                 need_ignore = (ignore_lib ? 1 : 0);
-    size_t              buf_used = 0;
-
-    if(NULL == buf || 0 == buf_len) return 0;
-
-#if defined(__arm__)
-    sig_pc = uc->uc_mcontext.arm_pc;
-#elif defined(__aarch64__)
-    sig_pc = uc->uc_mcontext.pc;
-#elif defined(__i386__)
-    sig_pc = uc->uc_mcontext.gregs[REG_EIP];
-#elif defined(__x86_64__)
-    sig_pc = uc->uc_mcontext.gregs[REG_RIP];
+    size_t buf_used;
+    
+#if defined(__arm__) || defined(__i386__)
+    if(api_level >= 16 && api_level <= 20)
+    {
+        if(0 == (buf_used = xcc_unwind_libcorkscrew_record(si, uc, buf, buf_len))) goto bottom;
+        return buf_used;
+    }
+#else
+    (void)si;
 #endif
 
-    buf[0] = '\0';
-    
-    _Unwind_Backtrace(xcc_unwind_callback, &state);
-
-    //find the signal frame
-    for(i = 0; i < state.cnt; i++)
+    if(api_level >= 21 && api_level <= 23)
     {
-        if(pc_buf[i] < sig_pc + sizeof(uintptr_t) && pc_buf[i] > sig_pc - sizeof(uintptr_t))
-        {
-            need_ignore = 0;
-            break;
-        }
-    }
-    if(i >= state.cnt) i = 0; //failed, record all frames
-
-    for(j = 0; i < state.cnt; i++, j++)
-    {
-        rel_pc = pc_buf[i];
-        name = "<unknown>";
-        symbol = NULL;
-        offset = 0;
-
-        //parse PC
-        if(dladdr((void *)(pc_buf[i]), &info))
-        {
-            rel_pc   = pc_buf[i] - (uintptr_t)info.dli_fbase;
-            name = info.dli_fname;
-            if(info.dli_sname)
-            {
-                symbol = info.dli_sname;
-                offset = pc_buf[i] - (uintptr_t)info.dli_saddr;
-            }
-        }
-        
-        //check ignore lib
-        if(need_ignore)
-        {
-            if(xcc_unwind_check_ignore_lib(name, ignore_lib))
-                continue;
-            else
-                need_ignore = 0;
-        }
-
-        //build line
-        len = xcc_fmt_snprintf(line, sizeof(line), "    #%02zu pc %0"XCC_UTIL_FMT_ADDR"  %s", j, rel_pc, name);
-        if(NULL != symbol)
-        {
-            len += xcc_fmt_snprintf(line + len, sizeof(line) - len, " (%s", symbol);
-            if(offset > 0)
-                len += xcc_fmt_snprintf(line + len, sizeof(line) - len, "+%"PRIuPTR, offset);
-            len += xcc_fmt_snprintf(line + len, sizeof(line) - len, ")");
-        }
-        len += xcc_fmt_snprintf(line + len, sizeof(line) - len, "\n");
-        
-        //copy to the buffer
-        if(buf_used + len < buf_len)
-        {
-            memcpy(buf + buf_used, line, len);
-            buf_used += len;
-            buf[buf_used] = '\0';
-        }
-        else
-        {
-            break;
-        }
+        if(0 == (buf_used = xcc_unwind_libunwind_record(uc, buf, buf_len))) goto bottom;
+        return buf_used;
     }
 
-    return buf_used;
+ bottom:
+    return xcc_unwind_clang_record(uc, buf, buf_len);
 }
